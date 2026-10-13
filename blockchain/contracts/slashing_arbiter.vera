@@ -1,0 +1,26 @@
+// ========================================================
+// VERA CHAIN CONSTITUTIONAL CONTRACT: Autonomous Slashing Arbiter
+// Arbitrates consensus violations (double signing or fraud) directly
+// within Flat-DAG bytecode and executes immediate on-chain slashing!
+// ========================================================
+
+// 1. Read cryptographic evidence submitted as witness
+OP_READ_WITNESS     r0, r0, r0, 0
+
+// 2. Validate Merkle proof of evidence against block root
+OP_MERKLE_VERIFY    r1, r0, r0, 1
+
+// 3. Invariant: Evidence must be mathematically authentic
+OP_ASSERT_EQ        r0, r1, 0xFF, 1
+
+// 4. Retrieve identifier of offending validator (ID 42)
+OP_SOURCE_READ       r2, r0, r0, 42
+
+// 5. Execute on-chain slashing penalty against offending validator!
+OP_SLASH_VALIDATOR  r3, r2, r0, 0
+
+// 6. Record completed arbitration status in public storage
+OP_SET_STORAGE      r0, r2, r3, 5555
+
+// 7. Halt transaction committing immutable penalty receipt
+OP_HALT             r0, r0, r0, 0

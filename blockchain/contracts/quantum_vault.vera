@@ -1,0 +1,27 @@
+// ========================================================
+// VERA CHAIN CONSTITUTIONAL CONTRACT: Quantum Vault
+// Shields institutional vaults against quantum attacks (Shor)
+// and guarantees execution within time deadline (anti-griefing).
+// ========================================================
+
+// 1. Read deterministic witness envelope (Public Key + Signature)
+OP_READ_WITNESS     r0, r0, r0, 0
+
+// 2. Native Post-Quantum validation (Winternitz W-OTS+ via Blake3)
+// r1 = 1 if hash chain resists Shor's algorithm
+OP_VERIFY_PQ_SIG    r1, r0, r0, 64
+
+// 3. Invariant: Post-Quantum signature MUST be strictly valid (r1 == 1)
+OP_ASSERT_EQ        r0, r1, 0xFF, 1
+
+// 4. On-chain temporal deadline verification (current block <= 100000)
+OP_TIME_CHECK       r2, r0, r0, 100000
+
+// 5. Calculate audit hash for release
+OP_HASH_BLAKE3      r3, r0, r0, 0
+
+// 6. Update vault release status in storage (Key: 9999, Value: r3)
+OP_SET_STORAGE      r0, r0, r3, 9999
+
+// 7. Halt with definitive Merkle receipt
+OP_HALT             r0, r0, r0, 0

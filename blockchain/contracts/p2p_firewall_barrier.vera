@@ -1,0 +1,26 @@
+// ========================================================
+// VERA CHAIN PROTOCOL CONTRACT: P2P Firewall & Sybil Reputation Barrier
+// Evaluates peer metrics of the P2P network on-chain.
+// Bans poisoned/sybil nodes autonomously in bytecode.
+// ========================================================
+
+// 1. Read peer activity witness submitted by node
+OP_READ_WITNESS       r0, r0, r0, 0
+
+// 2. Validate authenticity of peer signature or proof
+OP_MERKLE_VERIFY      r1, r0, r0, 1
+
+// 3. Invariant: Peer traffic report must be valid
+OP_ASSERT_EQ          r0, r1, 0xFF, 1
+
+// 4. Retrieve identifier of peer under evaluation (e.g. Peer ID 99)
+OP_SOURCE_READ        r2, r0, r0, 99
+
+// 5. Apply reputation penalty (-150 points) for delivering invalid block
+OP_PEER_SCORE         r3, r2, r0, -150
+
+// 6. Record ban status in public storage
+OP_SET_STORAGE        r0, r2, r3, 9999
+
+// 7. Halt transaction committing immutable ban
+OP_HALT               r0, r0, r0, 0

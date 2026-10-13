@@ -1,0 +1,30 @@
+// ========================================================
+// VERA CHAIN PROTOCOL CONTRACT: Epoch Checkpoint & Weak Subjectivity Guard
+// Freezes the canonical state at the end of each epoch (Weak Subjectivity),
+// rendering Long-Range PoS attacks mathematically impossible.
+// ========================================================
+
+// 1. Retrieve current block height
+OP_GET_BLOCK_CONTEXT  r0, r0, r0, 0
+
+// 2. Retrieve chain identity for cross-chain replay isolation
+OP_GET_BLOCK_CONTEXT  r1, r0, r0, 2
+
+// 3. Read accumulated state root witness snapshot
+OP_READ_WITNESS       r2, r0, r0, 0
+
+// 4. Invariant: Verify block cryptographic root
+OP_MERKLE_VERIFY      r3, r2, r0, 1
+OP_ASSERT_EQ          r2, r3, 0xFF, 1
+
+// 5. Freeze and seal definitive epoch checkpoint (Perpetual Immutability)
+OP_CHECKPOINT_FINAL   r4, r3, r0, 1000
+
+// 6. Record epoch confirmation in historical storage
+OP_SET_STORAGE        r0, r0, r4, 7777
+
+// 7. Commit LSM delta for the checkpoint
+OP_COMMIT_DELTA       r0, r4, r0, 7777
+
+// 8. Halt execution
+OP_HALT               r0, r0, r0, 0

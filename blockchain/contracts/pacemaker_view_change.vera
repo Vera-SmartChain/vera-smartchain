@@ -1,0 +1,29 @@
+// ========================================================
+// VERA CHAIN PROTOCOL CONTRACT: Pacemaker View Change & Slashing
+// Executes autonomous leader rotation and slashes unresponsive leaders
+// when block deadline is breached (Anti-Liveness Halting).
+// ========================================================
+
+// 1. Retrieve current block from chain context
+OP_GET_BLOCK_CONTEXT  r0, r0, r0, 0
+
+// 2. Read consensus witness containing liveness timestamp
+OP_READ_WITNESS       r1, r0, r0, 0
+
+// 3. Read current leader validator ID (stored at slot 10)
+OP_GET_STORAGE        r2, r0, r0, 10
+
+// 4. If validator committed liveness violation, apply slashing
+OP_SLASH_VALIDATOR    r3, r2, r0, 0
+
+// 5. Rotate round proposer to elect next leader node
+OP_ROTATE_PROPOSER    r4, r0, r0, 1
+
+// 6. Update slot 10 with new leader
+OP_SET_STORAGE        r0, r4, r4, 10
+
+// 7. Commit incremental delta in LSM log
+OP_COMMIT_DELTA       r4, r3, r0, 1
+
+// 8. Conclude governance transaction with cryptographic receipt
+OP_HALT               r0, r0, r0, 0

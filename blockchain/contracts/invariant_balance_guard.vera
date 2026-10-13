@@ -1,0 +1,30 @@
+// ========================================================
+// VERA CHAIN CONSTITUTIONAL CONTRACT: Invariant Balance Guard
+// Guarantees formal balance conservation: Balance_final == Balance_initial - Amount
+// Neither an AI agent nor human attacker can create balance out of thin air.
+// ========================================================
+
+// 1. Retrieve balance of origin account (ID 100)
+OP_GET_BALANCE      r0, r0, r0, 100
+
+// 2. Define amount to transfer (500 units)
+OP_SOURCE_READ       r1, r0, r0, 500
+
+// 3. Check if balance < amount (r2 = if r0 < r1 { 1 } else { 0 })
+OP_CMP_LT           r2, r0, r1, 0
+
+// 4. Critical Invariant: r2 MUST be 0 (balance CANNOT be less than amount!)
+// If r2 != 0, the node reverts the transaction immediately in O(1)
+OP_ASSERT_EQ        r0, r2, 0xFF, 0
+
+// 5. Deduct balance with mathematical precision without overflow/underflow
+OP_SUB              r3, r0, r1, 0
+
+// 6. Transfer funds to destination recipient (ID 200)
+OP_TRANSFER         r4, r1, r0, 200
+
+// 7. Write updated balance to decentralized storage
+OP_SET_STORAGE      r0, r0, r3, 100
+
+// 8. Deterministic termination producing Merkle Proof
+OP_HALT             r0, r0, r0, 0
