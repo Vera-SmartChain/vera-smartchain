@@ -232,4 +232,20 @@ impl P2PPayload {
             P2PPayload::SyncResponse(_) => MSG_TYPE_SYNC_RESPONSE,
         }
     }
+
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            P2PPayload::Handshake(_) => "Handshake",
+            P2PPayload::HandshakeAck(_) => "HandshakeAck",
+            P2PPayload::Ping { .. } => "Ping",
+            P2PPayload::Pong { .. } => "Pong",
+            P2PPayload::NewTransaction(_) => "NewTransaction",
+            P2PPayload::BlockProposal(_) => "BlockProposal",
+            P2PPayload::BftVote(_) => "BftVote",
+            P2PPayload::MiniVote(_) => "MiniVote",
+            P2PPayload::BlockCommit(_) => "BlockCommit",
+            P2PPayload::SyncRequest(_) => "SyncRequest",
+            P2PPayload::SyncResponse(_) => "SyncResponse",
+        }
+    }
 }
