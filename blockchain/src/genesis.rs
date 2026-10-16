@@ -204,11 +204,11 @@ impl GenesisConfig {
         let mut csprng = OsRng;
         let val_signing_key = SigningKey::generate(&mut csprng);
         let val_pubkey = val_signing_key.verifying_key().to_bytes();
-        let val_addr = vera_engine_v2::vera_hash_256(&val_pubkey);
+        let val_addr = crate::chain_hash::hash256(&val_pubkey);
 
         let user_signing_key = SigningKey::generate(&mut csprng);
         let user_pubkey = user_signing_key.verifying_key().to_bytes();
-        let user_addr = vera_engine_v2::vera_hash_256(&user_pubkey);
+        let user_addr = crate::chain_hash::hash256(&user_pubkey);
 
         let cfg = GenesisConfig {
             chain_id: "vera-testnet-1".to_string(),
@@ -249,7 +249,7 @@ impl GenesisConfig {
         let initial_validators: Vec<GenesisValidator> = initial_validator_pubkeys
             .iter()
             .map(|pk| {
-                let addr = vera_engine_v2::vera_hash_256(pk);
+                let addr = crate::chain_hash::hash256(pk);
                 GenesisValidator {
                     address: address_to_hex(&addr),
                     stake: stake_per_val.clone(),

@@ -46,14 +46,14 @@ impl<'a> CsmtDatabase<'a> {
         data.extend_from_slice(b"storage");
         data.extend_from_slice(addr);
         data.extend_from_slice(slot);
-        vera_engine_v2::vera_hash_256(&data)
+        crate::chain_hash::hash256(&data)
     }
 
     pub fn code_key(code_hash: &[u8; 32]) -> [u8; 32] {
         let mut data = Vec::with_capacity(4 + 32);
         data.extend_from_slice(b"code");
         data.extend_from_slice(code_hash);
-        vera_engine_v2::vera_hash_256(&data)
+        crate::chain_hash::hash256(&data)
     }
 }
 
@@ -208,7 +208,7 @@ pub fn execute_evm(
                     if let Some(code) = account.info.code {
                         if !code.is_empty() {
                             let code_bytes = code.original_bytes();
-                            let c_hash = vera_engine_v2::vera_hash_256(&code_bytes);
+                            let c_hash = crate::chain_hash::hash256(&code_bytes);
                             current.code_hash = c_hash;
                             let c_key = CsmtDatabase::code_key(&c_hash);
                             csmt.insert(c_key, code_bytes.to_vec());

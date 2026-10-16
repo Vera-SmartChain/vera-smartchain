@@ -2,7 +2,7 @@ use crate::account::{Account, Address, ExecutionReceipt, address_from_hex};
 use crate::block::Block;
 use crate::csmt::CSMT;
 use crate::transaction::Transaction;
-use vera_engine_v2::{ComputationGraph, canonical_hash};
+use vera_engine_v2::{ComputationGraph, canonical_encode};
 
 pub const BASE_TX_GAS: u64 = 21_000;
 pub const GAS_PER_INSTRUCTION: u64 = 100;
@@ -264,7 +264,7 @@ impl StateTransitionEngine {
             }
         } else if let Ok(graph) = serde_json::from_slice::<ComputationGraph>(&tx.program) {
             // Execution of native VERA Engine v2 smart contract
-            trace_root = canonical_hash(&graph);
+            trace_root = crate::chain_hash::hash256(&canonical_encode(&graph));
             execution_success = true;
             if sender_account.balance >= tx.amount {
                 if let Some(recipient_addr) = tx.to {
@@ -300,7 +300,7 @@ impl StateTransitionEngine {
             ) {
                 Ok(evm_res) => {
                     gas_used = evm_res.gas_used;
-                    trace_root = vera_engine_v2::vera_hash_256(&evm_res.output);
+                    trace_root = crate::chain_hash::hash256(&evm_res.output);
                     execution_success = evm_res.success;
                     evm_logs = evm_res.logs;
                     if !evm_res.success {
@@ -579,11 +579,11 @@ mod tests {
 
         let alice_key = SigningKey::generate(&mut csprng);
         let alice_pub = alice_key.verifying_key().to_bytes();
-        let alice_addr = vera_engine_v2::vera_hash_256(&alice_pub);
+        let alice_addr = crate::chain_hash::hash256(&alice_pub);
 
         let bob_key = SigningKey::generate(&mut csprng);
         let bob_pub = bob_key.verifying_key().to_bytes();
-        let bob_addr = vera_engine_v2::vera_hash_256(&bob_pub);
+        let bob_addr = crate::chain_hash::hash256(&bob_pub);
 
         // Initialize Alice with 100_000_000 VERA wei
         let alice_initial = Account::new(100_000_000);
@@ -641,7 +641,7 @@ mod tests {
 
         let alice_key = SigningKey::generate(&mut csprng);
         let alice_pub = alice_key.verifying_key().to_bytes();
-        let alice_addr = vera_engine_v2::vera_hash_256(&alice_pub);
+        let alice_addr = crate::chain_hash::hash256(&alice_pub);
 
         // Alice with 100 VERA
         let initial_balance: u128 = 100_000_000_000_000_000_000;
@@ -679,11 +679,11 @@ mod tests {
 
         let gov_key = SigningKey::generate(&mut csprng);
         let gov_pub = gov_key.verifying_key().to_bytes();
-        let gov_addr = vera_engine_v2::vera_hash_256(&gov_pub);
+        let gov_addr = crate::chain_hash::hash256(&gov_pub);
 
         let attacker_key = SigningKey::generate(&mut csprng);
         let attacker_pub = attacker_key.verifying_key().to_bytes();
-        let attacker_addr = vera_engine_v2::vera_hash_256(&attacker_pub);
+        let attacker_addr = crate::chain_hash::hash256(&attacker_pub);
 
         // Configure ValidatorSet with strict governance
         let mut val_set = ValidatorSet::new(vec![]);
@@ -775,7 +775,7 @@ mod tests {
 
         let alice_key = SigningKey::generate(&mut csprng);
         let alice_pub = alice_key.verifying_key().to_bytes();
-        let alice_addr = vera_engine_v2::vera_hash_256(&alice_pub);
+        let alice_addr = crate::chain_hash::hash256(&alice_pub);
 
         // Create contract account with non-payable bytecode
         // Bytecode: REVERT if receiving funds (any call reverts: 60006000fd)

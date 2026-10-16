@@ -20,7 +20,7 @@ pub mod jit_x86;
 
 // Convenient top-level re-exports
 pub use graph::{ComputationGraph, Node, NodeId, Op};
-pub use canonical::{canonical_hash, normalize};
+pub use canonical::{canonical_encode, canonical_hash, normalize};
 pub use multi_agent::{simulate_multi_agent_pipeline, generate_json_schema, VerificationResult};
 pub use vera_hash::{VeraHasher, hash as vera_hash_256, hash512 as vera_hash_512, hash_parallel as vera_hash_parallel};
 pub use tensor_hypercube::contract_hypercube;

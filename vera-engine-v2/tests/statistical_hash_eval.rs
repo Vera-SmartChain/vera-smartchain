@@ -1,21 +1,24 @@
-//! # Scientific Cryptographic Evaluation Suite ("Doctoral Dissertation")
+//! # Statistical Sanity Evaluation Suite for VERA-Hash
 //!
-//! Formal statistical validation battery for VERA-Hash:
+//! Note: These tests verify statistical pseudorandomness and distribution sanity
+//! (e.g. avalanche, bit independence, entropy), NOT cryptographic security proofs.
+//!
 //! 1. Strict Avalanche Criterion (SAC) - (Webster & Tavares, 1985)
 //! 2. Bit Independence Criterion (BIC)
 //! 3. Shannon Entropy of Output Distribution (Shannon Entropy >= 7.999 bits/byte)
 //! 4. Chi-Squared Goodness-of-Fit Test (\chi^2) against Uniform Distribution
-//! 5. Isomorphism and Collision-Resistance Proof for Oct-Tree DAG Folding
+//! 5. Statistical Consistency of Oct-Tree DAG Folding
+//! 6. 1024 B Regression Test (all sizes 0 to 4096 bytes: hash(x) == VeraHasher(x))
 
 use rand::{RngCore, SeedableRng};
 use rand::rngs::StdRng;
-use vera_engine_v2::vera_hash::{hash as vera_hash, hash_parallel, hash512};
+use vera_engine_v2::vera_hash::{hash as vera_hash, hash_parallel, hash512, VeraHasher};
 
-/// 1. Strict Avalanche Criterion (SAC)
-/// Theorem: If 1 single input bit is flipped, each output bit must have
-/// probability exactly p = 0.5 of flipping. In 256 bits, expected mean is 128 bits.
+/// 1. Strict Avalanche Criterion (SAC) - Statistical Sanity Check
+/// When 1 single input bit is flipped, each output bit should have
+/// probability ~0.5 of flipping (in 256 bits, expected mean ~128 bits).
 #[test]
-fn test_doctoral_strict_avalanche_criterion() {
+fn test_statistical_strict_avalanche_criterion() {
     let sample_count = 10_000;
     let mut rng = StdRng::seed_from_u64(0xDEADBEEF_CAFE1337);
 
@@ -53,33 +56,28 @@ fn test_doctoral_strict_avalanche_criterion() {
     let mean_percentage = (mean_flipped / 256.0) * 100.0;
 
     println!("\n=======================================================");
-    println!(" [DOCTORAL EVALUATION] STRICT AVALANCHE CRITERION (SAC) ");
+    println!(" [STATISTICAL SANITY] STRICT AVALANCHE CRITERION (SAC) ");
     println!(" Tested samples: {}", sample_count);
     println!(" Mean flipped bits: {:.4} of 256 ({:.3}%)", mean_flipped, mean_percentage);
     println!(" Observed range: [Min: {}, Max: {}]", min_flipped, max_flipped);
     println!("=======================================================");
 
-    // Strict Academic Criterion: Mean MUST be between 49.5% and 50.5% (126.7 to 129.3 bits)
     assert!(
         mean_percentage >= 49.5 && mean_percentage <= 50.5,
         "SAC Failed! Diffusion mean ({:.3}%) deviates from ideal 50.0%",
         mean_percentage
     );
 
-    // No sample may exhibit pathological diffusion (< 70 or > 186 bits)
     assert!(min_flipped > 70, "Minimum diffusion too low: {}", min_flipped);
     assert!(max_flipped < 186, "Maximum diffusion excessive: {}", max_flipped);
 }
 
-/// 2. Bit Independence Criterion (BIC)
-/// Theorem: The flipping behavior of any pair of output bits (i, j)
-/// must be statistically uncorrelated (Covariance -> 0).
+/// 2. Bit Independence Criterion (BIC) - Statistical Sanity Check
 #[test]
-fn test_doctoral_bit_independence_criterion() {
+fn test_statistical_bit_independence_criterion() {
     let sample_count = 5_000;
     let mut rng = StdRng::seed_from_u64(0x12345678_9ABCDEF0);
 
-    // Tracks correlation between first 16 output bits
     let num_tracked_bits = 16;
     let mut pair_both_flipped = vec![vec![0u32; num_tracked_bits]; num_tracked_bits];
 
@@ -112,7 +110,6 @@ fn test_doctoral_bit_independence_criterion() {
         }
     }
 
-    // Theoretical probability of both bits flipping independently: P(A) * P(B) = 0.5 * 0.5 = 0.25 (25%)
     let mut max_deviation = 0.0f64;
     for i in 0..num_tracked_bits {
         for j in 0..num_tracked_bits {
@@ -125,7 +122,7 @@ fn test_doctoral_bit_independence_criterion() {
     }
 
     println!("\n=======================================================");
-    println!(" [DOCTORAL EVALUATION] BIT INDEPENDENCE CRITERION (BIC) ");
+    println!(" [STATISTICAL SANITY] BIT INDEPENDENCE CRITERION (BIC) ");
     println!(" Analyzed samples: {}", sample_count);
     println!(" Maximum deviation from theoretical independence (25.0%): {:.3}%", max_deviation * 100.0);
     println!("=======================================================");
@@ -137,11 +134,9 @@ fn test_doctoral_bit_independence_criterion() {
     );
 }
 
-/// 3. Shannon Entropy & Chi-Squared Test (\chi^2)
-/// Theorem: Output of ideal cryptographic hash function must be indistinguishable
-/// from high-entropy white noise (Maximum entropy = 8.000 bits/byte).
+/// 3. Shannon Entropy & Chi-Squared Test (\chi^2) - Statistical Sanity Check
 #[test]
-fn test_doctoral_shannon_entropy_and_chi_squared() {
+fn test_statistical_shannon_entropy_and_chi_squared() {
     let iterations = 20_000;
     let mut byte_frequencies = [0u64; 256];
     let total_bytes = iterations * 32;
@@ -154,7 +149,6 @@ fn test_doctoral_shannon_entropy_and_chi_squared() {
         }
     }
 
-    // 1. Calculate Shannon Entropy: H = - sum(p * log2(p))
     let mut entropy = 0.0f64;
     for &count in &byte_frequencies {
         if count > 0 {
@@ -163,7 +157,6 @@ fn test_doctoral_shannon_entropy_and_chi_squared() {
         }
     }
 
-    // 2. Calculate Chi-Squared Statistic: \chi^2 = sum((O - E)^2 / E)
     let expected = total_bytes as f64 / 256.0;
     let mut chi_squared = 0.0f64;
     for &observed in &byte_frequencies {
@@ -172,20 +165,18 @@ fn test_doctoral_shannon_entropy_and_chi_squared() {
     }
 
     println!("\n=======================================================");
-    println!(" [DOCTORAL EVALUATION] SHANNON ENTROPY & CHI-SQUARED ");
+    println!(" [STATISTICAL SANITY] SHANNON ENTROPY & CHI-SQUARED ");
     println!(" Total analyzed bytes: {}", total_bytes);
     println!(" Observed entropy: {:.6} bits/byte (Theoretical Max: 8.000000)", entropy);
     println!(" Chi-Squared statistic (degrees of freedom = 255): {:.2}", chi_squared);
     println!("=======================================================");
 
-    // Requirement: Entropy strictly greater than 7.999 bits/byte
     assert!(
         entropy >= 7.9990,
         "Insufficient entropy: {:.6} < 7.9990",
         entropy
     );
 
-    // For 255 degrees of freedom, critical value at p=0.001 is ~310. Chi-squared must be well below.
     assert!(
         chi_squared < 320.0,
         "Chi-Squared uniformity test failed! Chi2 = {}",
@@ -193,11 +184,9 @@ fn test_doctoral_shannon_entropy_and_chi_squared() {
     );
 }
 
-/// 4. Isomorphism and Consistency of Oct-Tree DAG Folding
-/// Formal proof that payloads partitioned into powers of 8 and non-powers
-/// deterministically converge across Single-Thread and Rayon Multi-Thread modes.
+/// 4. Consistency of Oct-Tree DAG Folding
 #[test]
-fn test_doctoral_oct_tree_folding_invariants() {
+fn test_statistical_oct_tree_folding_invariants() {
     let sizes = [
         0, 1, 15, 64, 127, 128, 512, 1023, 1024, 1025,
         2048, 8192, 16384, 16385, 32768, 65536, 131072,
@@ -209,18 +198,52 @@ fn test_doctoral_oct_tree_folding_invariants() {
         let h_par = hash_parallel(&payload);
         let h_512 = hash512(&payload);
 
-        // Parallel and sequential versions must produce the exact same canonical hash
         assert_eq!(
             h_seq, h_par,
-            "Isomorphism violation at payload size {} bytes!",
+            "Consistency violation at payload size {} bytes!",
             size
         );
 
-        // 512-bit hash must contain 256-bit hash in prefix or derive deterministically from it
         assert_eq!(
             &h_seq[..], &h_512[..32],
             "Prefix inconsistency between 256-bit and 512-bit at payload size {} bytes!",
             size
         );
+    }
+}
+
+/// 5. 1024 B Regression Test: hash(x) == VeraHasher(x) for all sizes from 0 to 4096 bytes
+#[test]
+fn test_verahash_1024b_regression_all_sizes_0_to_4096() {
+    let mut rng = StdRng::seed_from_u64(0x1024_BEEF_C0DE);
+    let mut max_buf = vec![0u8; 4096];
+    rng.fill_bytes(&mut max_buf);
+
+    for size in 0..=4096 {
+        let slice = &max_buf[..size];
+        let h_oneshot = vera_hash(slice);
+
+        let mut hasher = VeraHasher::new();
+        hasher.update(slice);
+        let h_incremental = hasher.finalize();
+
+        assert_eq!(
+            h_oneshot, h_incremental,
+            "Regression mismatch for size {} bytes! oneshot={:?}, incremental={:?}",
+            size, h_oneshot, h_incremental
+        );
+
+        if size > 1 {
+            let mid = size / 2;
+            let mut chunked_hasher = VeraHasher::new();
+            chunked_hasher.update(&slice[..mid]);
+            chunked_hasher.update(&slice[mid..]);
+            let h_chunked = chunked_hasher.finalize();
+            assert_eq!(
+                h_oneshot, h_chunked,
+                "Chunked regression mismatch for size {} bytes (split at {})",
+                size, mid
+            );
+        }
     }
 }

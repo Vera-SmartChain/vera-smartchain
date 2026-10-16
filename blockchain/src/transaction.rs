@@ -36,7 +36,7 @@ impl Transaction {
     ) -> Self {
         let verifying_key = signing_key.verifying_key();
         let public_key = verifying_key.to_bytes();
-        let sender = vera_engine_v2::vera_hash_256(&public_key);
+        let sender = crate::chain_hash::hash256(&public_key);
 
         let mut tx = Self {
             chain_id: chain_id.to_string(),
@@ -60,7 +60,7 @@ impl Transaction {
     }
 
     pub fn signing_hash(&self) -> [u8; 32] {
-        let mut hasher = vera_engine_v2::VeraHasher::new();
+        let mut hasher = crate::chain_hash::ChainHasher::new();
         hasher.update(b"VERA_TX_V2");
         hasher.update(self.chain_id.as_bytes());
         hasher.update(&self.public_key);
@@ -87,7 +87,7 @@ impl Transaction {
         if let Some(ref raw) = self.raw_evm {
             crate::account::keccak256(raw)
         } else {
-            let mut hasher = vera_engine_v2::VeraHasher::new();
+            let mut hasher = crate::chain_hash::ChainHasher::new();
             hasher.update(&self.signing_hash());
             hasher.update(&self.signature);
             hasher.finalize()
@@ -113,7 +113,7 @@ impl Transaction {
         let verifying_key = VerifyingKey::from_bytes(&self.public_key)
             .map_err(|e| format!("Invalid public key: {}", e))?;
 
-        let expected_sender = vera_engine_v2::vera_hash_256(&self.public_key);
+        let expected_sender = crate::chain_hash::hash256(&self.public_key);
         if self.sender != expected_sender {
             return Err("Sender address does not match public_key hash".to_string());
         }

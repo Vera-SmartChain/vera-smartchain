@@ -163,7 +163,7 @@ impl FullNode {
 
         let address = if let Some(ref k) = keypair {
             let pubkey = k.verifying_key().to_bytes();
-            vera_engine_v2::vera_hash_256(&pubkey)
+            crate::chain_hash::hash256(&pubkey)
         } else {
             [0u8; 32]
         };
@@ -1137,7 +1137,7 @@ mod tests {
         use rand::rngs::OsRng;
         let test_user_key = SigningKey::generate(&mut OsRng);
         let test_user_pub = test_user_key.verifying_key().to_bytes();
-        let test_user_addr = vera_engine_v2::vera_hash_256(&test_user_pub);
+        let test_user_addr = crate::chain_hash::hash256(&test_user_pub);
 
         // 1. Attempt submitting tx from non-existent account -> immediate rejection
         let tx_no_acc = Transaction::new(

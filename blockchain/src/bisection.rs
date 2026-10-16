@@ -147,8 +147,8 @@ impl BisectionGame {
             return self.status.clone();
         }
 
-        // Canonical step execution: deterministic transition hash via VERA-Hash (ARX-64)
-        let mut hasher = vera_engine_v2::VeraHasher::new();
+        // Canonical step execution: deterministic transition hash via BLAKE3
+        let mut hasher = crate::chain_hash::ChainHasher::new();
         hasher.update(b"STEP_ARBITRATION");
         hasher.update(&self.left_hash);
         hasher.update(step_bytes);
@@ -214,7 +214,7 @@ mod tests {
 
         // Final arbitration of step 753 (atomic computation step)
         let step_bytes = b"OP_SUM_CANONICAL_STEP_753";
-        let mut h = vera_engine_v2::VeraHasher::new();
+        let mut h = crate::chain_hash::ChainHasher::new();
         h.update(b"STEP_ARBITRATION");
         h.update(&game.left_hash);
         h.update(step_bytes);

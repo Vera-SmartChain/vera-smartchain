@@ -11,9 +11,9 @@ serde_json = "1.0"
 rayon = "1.10"
 lz4_flex = "0.11"
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
+blake3 = { version = "1.8", features = ["rayon"] }
 
 [dev-dependencies]
-blake3 = { version = "1.5", features = ["rayon"] }
 rand = "0.8"
 
 [target.'cfg(windows)'.dependencies]

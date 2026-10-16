@@ -477,9 +477,9 @@ fn canonicalize_commutative(op: Op, hashes: &HashMap<NodeId, [u8; 32]>) -> Op {
     }
 }
 
-/// Computes deterministic VERA hash for a node based on operation and child node hashes
+/// Computes deterministic BLAKE3 hash for a node based on operation and child node hashes
 fn compute_node_hash(op: &Op, hashes: &HashMap<NodeId, [u8; 32]>) -> [u8; 32] {
-    let mut hasher = crate::vera_hash::VeraHasher::new();
+    let mut hasher = blake3::Hasher::new();
     match op {
         Op::Input(idx) => {
             hasher.update(&[0x01]);
@@ -567,112 +567,121 @@ fn compute_node_hash(op: &Op, hashes: &HashMap<NodeId, [u8; 32]>) -> [u8; 32] {
             hasher.update(&rot.to_le_bytes());
         }
     }
-    hasher.finalize()
+    *hasher.finalize().as_bytes()
 }
 
-/// Generates native 32-byte VERA Canonical Hash for any ComputationGraph.
+/// Generates deterministic binary topological encoding of normalized DAG.
 /// Performs direct in-memory binary topological encoding of normalized DAG,
 /// completely eliminating human JSON or text string serialization.
-/// Guarantees that isomorphic representations converge to the exact same 256-bit identity.
-pub fn canonical_hash(graph: &ComputationGraph) -> [u8; 32] {
+/// Guarantees that isomorphic representations converge to the exact same byte vector.
+pub fn canonical_encode(graph: &ComputationGraph) -> Vec<u8> {
     let normalized = normalize(graph);
-    let mut hasher = crate::vera_hash::VeraHasher::new();
+    let mut bytes = Vec::new();
 
     // VERA Canonical Header: magic identifier and node count
-    hasher.update(b"VERA_DAG_V2");
-    hasher.update(&(normalized.nodes.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(b"VERA_DAG_V2");
+    bytes.extend_from_slice(&(normalized.nodes.len() as u32).to_le_bytes());
 
     // Direct in-memory binary topological encoding
     for node in &normalized.nodes {
         match &node.op {
             Op::Input(idx) => {
-                hasher.update(&[0x01]);
-                hasher.update(&idx.to_le_bytes());
+                bytes.push(0x01);
+                bytes.extend_from_slice(&idx.to_le_bytes());
             }
             Op::ConstI64(v) => {
-                hasher.update(&[0x02]);
-                hasher.update(&v.to_le_bytes());
+                bytes.push(0x02);
+                bytes.extend_from_slice(&v.to_le_bytes());
             }
             Op::Add(a, b) => {
-                hasher.update(&[0x03]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x03);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::Sub(a, b) => {
-                hasher.update(&[0x04]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x04);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::Mul(a, b) => {
-                hasher.update(&[0x05]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x05);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::Div(a, b) => {
-                hasher.update(&[0x06]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x06);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::And(a, b) => {
-                hasher.update(&[0x07]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x07);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::Or(a, b) => {
-                hasher.update(&[0x08]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x08);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::Xor(a, b) => {
-                hasher.update(&[0x09]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x09);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::Select {
                 cond,
                 if_true,
                 if_false,
             } => {
-                hasher.update(&[0x0A]);
-                hasher.update(&(cond.0 as u32).to_le_bytes());
-                hasher.update(&(if_true.0 as u32).to_le_bytes());
-                hasher.update(&(if_false.0 as u32).to_le_bytes());
+                bytes.push(0x0A);
+                bytes.extend_from_slice(&(cond.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(if_true.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(if_false.0 as u32).to_le_bytes());
             }
             Op::Output(target) => {
-                hasher.update(&[0x0B]);
-                hasher.update(&(target.0 as u32).to_le_bytes());
+                bytes.push(0x0B);
+                bytes.extend_from_slice(&(target.0 as u32).to_le_bytes());
             }
             Op::SaturatingAdd(a, b) => {
-                hasher.update(&[0x0C]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x0C);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::SaturatingSub(a, b) => {
-                hasher.update(&[0x0D]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
+                bytes.push(0x0D);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
             }
             Op::RotL(a, shift) => {
-                hasher.update(&[0x0E]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&shift.to_le_bytes());
+                bytes.push(0x0E);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&shift.to_le_bytes());
             }
             Op::RotR(a, shift) => {
-                hasher.update(&[0x0F]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&shift.to_le_bytes());
+                bytes.push(0x0F);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&shift.to_le_bytes());
             }
             Op::FusedARX { a, b, d, m, rot } => {
-                hasher.update(&[0x10]);
-                hasher.update(&(a.0 as u32).to_le_bytes());
-                hasher.update(&(b.0 as u32).to_le_bytes());
-                hasher.update(&(d.0 as u32).to_le_bytes());
-                hasher.update(&(m.0 as u32).to_le_bytes());
-                hasher.update(&rot.to_le_bytes());
+                bytes.push(0x10);
+                bytes.extend_from_slice(&(a.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(b.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(d.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&(m.0 as u32).to_le_bytes());
+                bytes.extend_from_slice(&rot.to_le_bytes());
             }
         }
     }
 
+    bytes
+}
+
+/// Generates experimental research 32-byte VERA Canonical Hash for a ComputationGraph.
+/// Note: Production consensus uses canonical_encode() + BLAKE3.
+pub fn canonical_hash(graph: &ComputationGraph) -> [u8; 32] {
+    let bytes = canonical_encode(graph);
+    let mut hasher = crate::vera_hash::VeraHasher::new();
+    hasher.update(&bytes);
     hasher.finalize()
 }
 
@@ -783,5 +792,120 @@ mod tests {
             hash_a, hash_b,
             "AI agents with different generation orders must converge to the exact same canonical hash"
         );
+        assert_eq!(
+            canonical_encode(&g_a),
+            canonical_encode(&g_b),
+            "AI agents with different generation orders must converge to the exact same canonical_encode"
+        );
+    }
+
+    #[test]
+    fn test_commutativity_canonical_encode() {
+        // Commutative operations: Add, Mul, SaturatingAdd, And, Or, Xor
+        // 1. Add
+        let mut g1 = ComputationGraph::new();
+        let a1 = g1.add_input(0);
+        let b1 = g1.add_input(1);
+        let sum1 = g1.add_add(a1, b1);
+        g1.set_output(sum1);
+
+        let mut g2 = ComputationGraph::new();
+        let a2 = g2.add_input(0);
+        let b2 = g2.add_input(1);
+        let sum2 = g2.add_add(b2, a2);
+        g2.set_output(sum2);
+
+        assert_eq!(
+            canonical_encode(&g1),
+            canonical_encode(&g2),
+            "Add(a, b) and Add(b, a) must produce identical canonical_encode"
+        );
+
+        // 2. Mul
+        let mut g3 = ComputationGraph::new();
+        let a3 = g3.add_input(0);
+        let b3 = g3.add_input(1);
+        let mul3 = g3.add_mul(a3, b3);
+        g3.set_output(mul3);
+
+        let mut g4 = ComputationGraph::new();
+        let a4 = g4.add_input(0);
+        let b4 = g4.add_input(1);
+        let mul4 = g4.add_mul(b4, a4);
+        g4.set_output(mul4);
+
+        assert_eq!(
+            canonical_encode(&g3),
+            canonical_encode(&g4),
+            "Mul(a, b) and Mul(b, a) must produce identical canonical_encode"
+        );
+
+        // 3. And / Or / Xor
+        let mut g5 = ComputationGraph::new();
+        let a5 = g5.add_input(0);
+        let b5 = g5.add_input(1);
+        let x5 = g5.add_xor(a5, b5);
+        g5.set_output(x5);
+
+        let mut g6 = ComputationGraph::new();
+        let a6 = g6.add_input(0);
+        let b6 = g6.add_input(1);
+        let x6 = g6.add_xor(b6, a6);
+        g6.set_output(x6);
+
+        assert_eq!(
+            canonical_encode(&g5),
+            canonical_encode(&g6),
+            "Xor(a, b) and Xor(b, a) must produce identical canonical_encode"
+        );
+    }
+
+    #[test]
+    fn test_canonical_encode_fixed_vector_and_trace_root() {
+        let mut g = ComputationGraph::new();
+        let in0 = g.add_input(0);
+        let in1 = g.add_input(1);
+        let sum = g.add_add(in0, in1);
+        g.set_output(sum);
+
+        let encoded = canonical_encode(&g);
+        let trace_root = *blake3::hash(&encoded).as_bytes();
+
+        // Also build graph with reversed addition operand order:
+        let mut g_rev = ComputationGraph::new();
+        let r0 = g_rev.add_input(0);
+        let r1 = g_rev.add_input(1);
+        let sum_rev = g_rev.add_add(r1, r0);
+        g_rev.set_output(sum_rev);
+
+        let encoded_rev = canonical_encode(&g_rev);
+        let trace_root_rev = *blake3::hash(&encoded_rev).as_bytes();
+
+        assert_eq!(encoded, encoded_rev, "Canonical encodings must match");
+        assert_eq!(trace_root, trace_root_rev, "BLAKE3 trace roots must match");
+
+        // Validate fixed vector length and magic header
+        assert_eq!(&encoded[0..11], b"VERA_DAG_V2");
+        assert_eq!(encoded.len(), 39);
+
+        // Fixed canonical encoding byte vector
+        let expected_bytes: Vec<u8> = vec![
+            // Magic header: "VERA_DAG_V2"
+            0x56, 0x45, 0x52, 0x41, 0x5F, 0x44, 0x41, 0x47, 0x5F, 0x56, 0x32,
+            // Node count: 4 (u32 little-endian)
+            0x04, 0x00, 0x00, 0x00,
+            // Node 0: Op::Input(0) -> [0x01, 0, 0, 0, 0]
+            0x01, 0x00, 0x00, 0x00, 0x00,
+            // Node 1: Op::Input(1) -> [0x01, 1, 0, 0, 0]
+            0x01, 0x01, 0x00, 0x00, 0x00,
+            // Node 2: Op::Add(0, 1) -> [0x03, 0, 0, 0, 0, 1, 0, 0, 0]
+            0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            // Node 3: Op::Output(2) -> [0x0B, 2, 0, 0, 0]
+            0x0B, 0x02, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(encoded, expected_bytes, "Canonical byte vector must match exact fixed vector");
+
+        let expected_trace_root = *blake3::hash(&expected_bytes).as_bytes();
+        assert_eq!(trace_root, expected_trace_root, "Trace root must match BLAKE3 of fixed vector");
     }
 }

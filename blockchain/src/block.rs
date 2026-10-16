@@ -17,7 +17,7 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     pub fn hash(&self) -> [u8; 32] {
-        let mut hasher = vera_engine_v2::VeraHasher::new();
+        let mut hasher = crate::chain_hash::ChainHasher::new();
         hasher.update(b"VERA_BLOCK_HEADER_V2");
         hasher.update(&self.height.to_le_bytes());
         hasher.update(&self.prev_hash);
@@ -83,7 +83,7 @@ impl Block {
         let hashes: Vec<[u8; 32]> = sorted
             .iter()
             .map(|c| {
-                let mut hasher = vera_engine_v2::VeraHasher::new();
+                let mut hasher = crate::chain_hash::ChainHasher::new();
                 hasher.update(b"COMMIT_SIGNATURE");
                 hasher.update(&c.validator_pubkey);
                 hasher.update(&c.signature);
@@ -124,7 +124,7 @@ impl Block {
             for chunk in current_layer.chunks(2) {
                 let left = chunk[0];
                 let right = if chunk.len() > 1 { chunk[1] } else { left };
-                let mut hasher = vera_engine_v2::VeraHasher::new();
+                let mut hasher = crate::chain_hash::ChainHasher::new();
                 hasher.update(b"MERKLE_NODE");
                 hasher.update(&left);
                 hasher.update(&right);

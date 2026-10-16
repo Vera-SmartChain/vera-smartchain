@@ -5,31 +5,31 @@
   "validator_count": 2,
   "initial_validators": [
     {
-      "address": "0x108a18392158331001fb154901f7ad53f5b630fa7a7f64bc85339124fa3efab4",
+      "address": "0x19824ac38727c94e97a4d51651ebe350b3571b4d9a46dc09bd2b53068a3e34cb",
       "stake": "32000000000000000000",
       "public_key": "8d2b423c2b284f1a1ed40730c4e7b6d317042965eb77e24d245bafe279f50a75"
     },
     {
-      "address": "0x36689d7847a6c272635eaacaaed1ec9cf4820d99213becfabadc8df79ea6202c",
+      "address": "0x9393907ce109384586bc753c04bfd3d9bba7d37bac7db0b1aec7f45f40607840",
       "stake": "32000000000000000000",
       "public_key": "b0e860166167e5e8b09d4d310f3f8a2b7f04518498ca7c177e259dabbf1f8a21"
     }
   ],
   "initial_accounts": [
     {
-      "address": "0x75bbe1ee679d8bb861a4fc82bc89484f7e996ee03720e77003b35f692ddd2146",
+      "address": "0x596bb3da434843b7bd1657cd828194a6639ea1521ce6b07d507fe0cb991e2df3",
       "balance": "1000000000000000000000"
     },
     {
-      "address": "0x108a18392158331001fb154901f7ad53f5b630fa7a7f64bc85339124fa3efab4",
+      "address": "0x19824ac38727c94e97a4d51651ebe350b3571b4d9a46dc09bd2b53068a3e34cb",
       "balance": "50000000000000000000"
     },
     {
-      "address": "0x36689d7847a6c272635eaacaaed1ec9cf4820d99213becfabadc8df79ea6202c",
+      "address": "0x9393907ce109384586bc753c04bfd3d9bba7d37bac7db0b1aec7f45f40607840",
       "balance": "50000000000000000000"
     },
     {
-      "address": "0x03e7d1316d9c04444ccda7e4703b151623c2c0062e1ccf863703c2be2b5ac9d5",
+      "address": "0xd12949512c92d3e70be1789b3f086044c4483205a20f29b34b066396c00f0ea5",
       "balance": "10000000000000000000"
     }
   ],
@@ -39,9 +39,9 @@
   "unbonding_period_blocks": 5,
   "max_missed_blocks": 10,
   "permissioned_validators": true,
-  "governance_address": "0x03e7d1316d9c04444ccda7e4703b151623c2c0062e1ccf863703c2be2b5ac9d5",
+  "governance_address": "0xd12949512c92d3e70be1789b3f086044c4483205a20f29b34b066396c00f0ea5",
   "validator_allowlist": [
-    "0x108a18392158331001fb154901f7ad53f5b630fa7a7f64bc85339124fa3efab4",
-    "0x36689d7847a6c272635eaacaaed1ec9cf4820d99213becfabadc8df79ea6202c"
+    "0x19824ac38727c94e97a4d51651ebe350b3571b4d9a46dc09bd2b53068a3e34cb",
+    "0x9393907ce109384586bc753c04bfd3d9bba7d37bac7db0b1aec7f45f40607840"
   ]
 }

@@ -68,7 +68,7 @@ impl Vote {
     }
 
     pub fn signing_hash(&self) -> [u8; 32] {
-        let mut hasher = vera_engine_v2::VeraHasher::new();
+        let mut hasher = crate::chain_hash::ChainHasher::new();
         hasher.update(b"VERA_BFT_VOTE_V2");
         hasher.update(self.chain_id.as_bytes());
         hasher.update(&self.height.to_le_bytes());
@@ -351,7 +351,7 @@ impl ValidatorSet {
             return Err("No active validator has stake".to_string());
         }
 
-        let mut hasher = vera_engine_v2::VeraHasher::new();
+        let mut hasher = crate::chain_hash::ChainHasher::new();
         hasher.update(b"VERA_STAKE_WEIGHTED_PROPOSER_V1");
         hasher.update(&height.to_le_bytes());
         hasher.update(&round.to_le_bytes());
@@ -498,21 +498,21 @@ mod tests {
 
         let val_set = ValidatorSet::new(vec![
             Validator {
-                address: vera_engine_v2::vera_hash_256(&pub1),
+                address: crate::chain_hash::hash256(&pub1),
                 public_key: pub1,
                 stake: 40,
                 missed_blocks: 0,
                 is_jailed: false,
             },
             Validator {
-                address: vera_engine_v2::vera_hash_256(&pub2),
+                address: crate::chain_hash::hash256(&pub2),
                 public_key: pub2,
                 stake: 40,
                 missed_blocks: 0,
                 is_jailed: false,
             },
             Validator {
-                address: vera_engine_v2::vera_hash_256(&pub3),
+                address: crate::chain_hash::hash256(&pub3),
                 public_key: pub3,
                 stake: 20,
                 missed_blocks: 0,

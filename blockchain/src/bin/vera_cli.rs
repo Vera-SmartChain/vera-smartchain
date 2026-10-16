@@ -5,7 +5,7 @@ use vera_blockchain::account::{address_from_hex, address_to_hex};
 use vera_blockchain::csmt::MerkleProof;
 use vera_blockchain::genesis::GenesisConfig;
 use vera_blockchain::transaction::Transaction;
-use vera_engine_v2::{canonical_hash, normalize, ComputationGraph};
+use vera_engine_v2::{canonical_encode, normalize, ComputationGraph};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -482,7 +482,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let normalized = normalize(&graph);
             let canonical_bytes = normalized.to_json();
-            let hash = canonical_hash(&graph);
+            let hash = vera_blockchain::chain_hash::hash256(&canonical_encode(&graph));
             std::fs::write(out_path, canonical_bytes.as_bytes())?;
 
             println!("✅ VERA v2 Contract successfully compiled and normalized!");

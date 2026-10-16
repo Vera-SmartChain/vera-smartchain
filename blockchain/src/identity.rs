@@ -16,12 +16,12 @@ pub struct IdentityRecord {
 impl IdentityRecord {
     /// Computes the canonical CSMT key for this domain
     pub fn csmt_key(domain: &str) -> [u8; 32] {
-        vera_engine_v2::vera_hash_256(format!("vera:identity:{}", domain.to_lowercase()).as_bytes())
+        crate::chain_hash::hash256(format!("vera:identity:{}", domain.to_lowercase()).as_bytes())
     }
 
     /// Computes identity commitment hash
     pub fn commitment_hash(&self) -> [u8; 32] {
-        let mut hasher = vera_engine_v2::VeraHasher::new();
+        let mut hasher = crate::chain_hash::ChainHasher::new();
         hasher.update(self.domain.to_lowercase().as_bytes());
         hasher.update(self.org_id.as_bytes());
         hasher.update(self.public_key.as_bytes());
@@ -37,7 +37,7 @@ impl IdentityRecord {
         server_nonce: &[u8; 32],
         shared_seed: &[u8; 32],
     ) -> [u8; 32] {
-        let mut hasher = vera_engine_v2::VeraHasher::new();
+        let mut hasher = crate::chain_hash::ChainHasher::new();
         hasher.update(client_nonce);
         hasher.update(server_nonce);
         hasher.update(shared_seed);
@@ -58,7 +58,7 @@ impl IdentityProof {
     /// Ultra-fast local validation (<1ms) without querying third-party CAs
     pub fn verify(&self) -> bool {
         let commitment = self.identity.commitment_hash();
-        let expected_val_hash = vera_engine_v2::vera_hash_256(&commitment);
+        let expected_val_hash = crate::chain_hash::hash256(&commitment);
         if self.merkle_proof.value_hash != Some(expected_val_hash) {
             return false;
         }
@@ -87,7 +87,7 @@ mod tests {
         let mut csmt = CSMT::new();
 
         let domain = "google.com";
-        let cert_hash = vera_engine_v2::vera_hash_256(b"test_x509_cert_data");
+        let cert_hash = crate::chain_hash::hash256(b"test_x509_cert_data");
         let identity = IdentityRecord {
             domain: domain.to_string(),
             org_id: "org_google_corp".to_string(),

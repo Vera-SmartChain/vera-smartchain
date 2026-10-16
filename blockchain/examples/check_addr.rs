@@ -19,7 +19,7 @@ fn main() {
     };
 
     let pubkey = signing_key.verifying_key().to_bytes();
-    let addr = vera_engine_v2::vera_hash_256(&pubkey);
+    let addr = vera_blockchain::chain_hash::hash256(&pubkey);
 
     if generated {
         println!("Private Key:  0x{}", hex::encode(signing_key.to_bytes()));

@@ -145,7 +145,7 @@ fn test_pos_bft_and_bisection_arbitration() {
     assert_eq!(game.right - game.left, 1);
 
     let step_bytes = b"CONTESTED_STEP_7";
-    let mut h = vera_engine_v2::VeraHasher::new();
+    let mut h = vera_blockchain::chain_hash::ChainHasher::new();
     h.update(b"STEP_ARBITRATION");
     h.update(&game.left_hash);
     h.update(step_bytes);

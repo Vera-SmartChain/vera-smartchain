@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 pub const EMPTY_HASH: [u8; 32] = [0u8; 32];
 
 fn hash_leaf(key: &[u8; 32], value_hash: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = vera_engine_v2::VeraHasher::new();
+    let mut hasher = crate::chain_hash::ChainHasher::new();
     hasher.update(b"LEAF");
     hasher.update(key);
     hasher.update(value_hash);
@@ -12,7 +12,7 @@ fn hash_leaf(key: &[u8; 32], value_hash: &[u8; 32]) -> [u8; 32] {
 }
 
 fn hash_internal(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut hasher = vera_engine_v2::VeraHasher::new();
+    let mut hasher = crate::chain_hash::ChainHasher::new();
     hasher.update(b"INTERNAL");
     hasher.update(left);
     hasher.update(right);
@@ -129,7 +129,7 @@ impl CSMT {
     }
 
     pub fn insert(&mut self, key: [u8; 32], value: Vec<u8>) {
-        let val_hash = vera_engine_v2::vera_hash_256(&value);
+        let val_hash = crate::chain_hash::hash256(&value);
         self.values.insert(key, value);
         self.root_node = Self::insert_at(self.root_node.clone(), key, val_hash, 0);
     }
@@ -341,13 +341,13 @@ mod tests {
         let mut tree = CSMT::new();
         assert_eq!(tree.root(), EMPTY_HASH);
 
-        let key1 = vera_engine_v2::vera_hash_256(b"account_alice");
+        let key1 = crate::chain_hash::hash256(b"account_alice");
         let val1 = b"balance=1000,nonce=0".to_vec();
 
-        let key2 = vera_engine_v2::vera_hash_256(b"account_bob");
+        let key2 = crate::chain_hash::hash256(b"account_bob");
         let val2 = b"balance=500,nonce=1".to_vec();
 
-        let key_absent = vera_engine_v2::vera_hash_256(b"account_eve");
+        let key_absent = crate::chain_hash::hash256(b"account_eve");
 
         tree.insert(key1, val1.clone());
         tree.insert(key2, val2.clone());

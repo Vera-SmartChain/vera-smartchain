@@ -1,4 +1,4 @@
-//! # VERA-Hash: ARX-64 High-Speed Cryptographic Hash Function
+//! # VERA-Hash: Experimental ARX-64 Cryptographic Research Hash Function
 //!
 //! Architecture:
 //! - Native 64-bit words (`u64`)
@@ -6,6 +6,9 @@
 //! - ARX primitives (Add, RotR, Xor) matching 1-cycle x86-64 instructions
 //! - Oct-Tree DAG Folding (Arity-8 tree reduction)
 //! - Massive multi-thread parallelism via Rayon for large payloads
+//!
+//! Note: Blockchain consensus and state commitment on Vera SmartChain utilize BLAKE3.
+//! VERA-Hash is an experimental research hash function and is NOT used in blockchain consensus.
 
 use rayon::prelude::*;
 
@@ -269,18 +272,16 @@ impl VeraHasher {
 
     pub fn update(&mut self, mut input: &[u8]) {
         while !input.is_empty() {
-            let available = CHUNK_SIZE - self.buffer.len();
-            if input.len() >= available {
-                self.buffer.extend_from_slice(&input[..available]);
+            if self.buffer.len() == CHUNK_SIZE {
                 let node = hash_chunk(&self.buffer, self.chunk_counter, false);
                 self.chunk_nodes.push(node);
                 self.chunk_counter += 1;
                 self.buffer.clear();
-                input = &input[available..];
-            } else {
-                self.buffer.extend_from_slice(input);
-                break;
             }
+            let want = CHUNK_SIZE - self.buffer.len();
+            let take = std::cmp::min(want, input.len());
+            self.buffer.extend_from_slice(&input[..take]);
+            input = &input[take..];
         }
     }
 
@@ -305,7 +306,7 @@ impl VeraHasher {
         out
     }
 
-    /// Finalizes hash and returns 64 bytes (512 bits post-quantum)
+    /// Finalizes hash and returns 64 bytes (512-bit research digest)
     pub fn finalize_512(&self) -> [u8; OUT_LEN_512] {
         let cv = if self.chunk_nodes.is_empty() {
             hash_chunk(&self.buffer, 0, true)
@@ -392,7 +393,7 @@ pub fn hash(data: &[u8]) -> [u8; OUT_LEN_256] {
     }
 }
 
-/// High-speed convenience function for 512 bits (Post-Quantum)
+/// High-speed convenience function for 512-bit digest (experimental research)
 pub fn hash512(data: &[u8]) -> [u8; OUT_LEN_512] {
     if data.len() <= CHUNK_SIZE {
         let cv = hash_chunk(data, 0, true);

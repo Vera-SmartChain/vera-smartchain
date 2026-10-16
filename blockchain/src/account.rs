@@ -64,7 +64,7 @@ pub fn address_to_hex(addr: &Address) -> String {
 }
 
 pub fn address_from_pubkey(pubkey: &[u8; 32]) -> Address {
-    vera_engine_v2::vera_hash_256(pubkey)
+    crate::chain_hash::hash256(pubkey)
 }
 
 /// VERA Account Model
@@ -153,7 +153,7 @@ pub struct ExecutionReceipt {
 
 impl ExecutionReceipt {
     pub fn hash(&self) -> [u8; 32] {
-        let mut hasher = vera_engine_v2::VeraHasher::new();
+        let mut hasher = crate::chain_hash::ChainHasher::new();
         hasher.update(&self.tx_hash);
         hasher.update(&[if self.success { 1 } else { 0 }]);
         hasher.update(&self.gas_used.to_le_bytes());

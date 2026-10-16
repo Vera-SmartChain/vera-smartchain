@@ -1499,7 +1499,7 @@ impl RpcHandler {
                             let hash = if i == 0 {
                                 format!("0x{}", hex::encode(n.latest_block_hash))
                             } else {
-                                format!("0x{}", hex::encode(vera_engine_v2::vera_hash_256(format!("block_hash_{}", h).as_bytes())))
+                                format!("0x{}", hex::encode(crate::chain_hash::hash256(format!("block_hash_{}", h).as_bytes())))
                             };
                             let effective_time = network_restart_ts.saturating_add(h * 12);
                             (effective_time, hash, proposer_hex.clone(), 1, state_root_hex.clone())
