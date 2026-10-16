@@ -8,6 +8,9 @@ pub const MAX_P2P_FRAME_SIZE: usize = 4 * 1024 * 1024;
 /// Maximum timeout for receiving a full frame (10 seconds) against Slowloris
 pub const P2P_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum timeout for transmitting a full frame (10 seconds) against dead/stalled peers
+pub const P2P_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Reads a binary frame from stream with timeout protection and size limit
 pub async fn read_raw_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(u8, Vec<u8>), String> {
     let read_future = async {
@@ -48,33 +51,40 @@ pub async fn read_raw_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(u8,
     }
 }
 
-/// Writes a binary frame to stream with length prefix
+/// Writes a binary frame to stream with length prefix and timeout protection
 pub async fn write_raw_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     msg_type: u8,
     payload: &[u8],
 ) -> Result<(), String> {
-    let frame_len = 1 + payload.len();
-    if frame_len > MAX_P2P_FRAME_SIZE {
-        return Err(format!(
-            "Attempted to send P2P frame exceeding 4MB: {} bytes",
-            frame_len
-        ));
-    }
+    let write_future = async {
+        let frame_len = 1 + payload.len();
+        if frame_len > MAX_P2P_FRAME_SIZE {
+            return Err(format!(
+                "Attempted to send P2P frame exceeding 4MB: {} bytes",
+                frame_len
+            ));
+        }
 
-    let len_bytes = (frame_len as u32).to_be_bytes();
-    writer.write_all(&len_bytes).await
-        .map_err(|e| format!("Failed to write P2P frame length: {}", e))?;
-    writer.write_all(&[msg_type]).await
-        .map_err(|e| format!("Failed to write P2P message type: {}", e))?;
-    if !payload.is_empty() {
-        writer.write_all(payload).await
-            .map_err(|e| format!("Failed to write P2P payload: {}", e))?;
-    }
-    writer.flush().await
-        .map_err(|e| format!("Failed to flush P2P buffer: {}", e))?;
+        let len_bytes = (frame_len as u32).to_be_bytes();
+        writer.write_all(&len_bytes).await
+            .map_err(|e| format!("Failed to write P2P frame length: {}", e))?;
+        writer.write_all(&[msg_type]).await
+            .map_err(|e| format!("Failed to write P2P message type: {}", e))?;
+        if !payload.is_empty() {
+            writer.write_all(payload).await
+                .map_err(|e| format!("Failed to write P2P payload: {}", e))?;
+        }
+        writer.flush().await
+            .map_err(|e| format!("Failed to flush P2P buffer: {}", e))?;
 
-    Ok(())
+        Ok(())
+    };
+
+    match tokio::time::timeout(P2P_WRITE_TIMEOUT, write_future).await {
+        Ok(res) => res,
+        Err(_) => Err("P2P frame write timeout reached (Dead/Stalled Peer Defense)".to_string()),
+    }
 }
 
 /// Serializes and sends a high-level message

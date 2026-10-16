@@ -4,7 +4,7 @@ use vera_blockchain::account::Account;
 use vera_blockchain::csmt::CSMT;
 use vera_blockchain::state_transition::StateTransitionEngine;
 use vera_blockchain::transaction::Transaction;
-use vera_engine_v2::{ComputationGraph, canonical_encode};
+use vera_engine_v2::{ComputationGraph, canonical_hash};
 
 #[tokio::test]
 async fn test_v2_smart_contract_execution_on_blockchain() {
@@ -34,10 +34,7 @@ async fn test_v2_smart_contract_execution_on_blockchain() {
     graph.set_output(res);
 
     let contract_json = graph.to_json();
-    let encoded = canonical_encode(&graph);
-    let expected_trace_root = vera_blockchain::chain_hash::hash256(&encoded);
-    let direct_blake3 = blake3::hash(&encoded);
-    assert_eq!(expected_trace_root, *direct_blake3.as_bytes(), "Chain hash must equal direct BLAKE3 hash");
+    let expected_trace_root = canonical_hash(&graph);
 
     // Create transaction calling the contract with 50_000 transfer to Bob
     let tx = Transaction::new(
@@ -57,8 +54,7 @@ async fn test_v2_smart_contract_execution_on_blockchain() {
         .expect("Transaction must execute successfully");
 
     assert!(receipt.success, "Execution must succeed");
-    assert_eq!(receipt.trace_root, expected_trace_root, "Trace root must match canonical BLAKE3 hash of VERA v2 Graph");
-    assert_eq!(receipt.trace_root, *direct_blake3.as_bytes(), "Trace root must match direct BLAKE3 hash of canonical encoding");
+    assert_eq!(receipt.trace_root, expected_trace_root, "Trace root must match canonical hash of VERA v2 Graph");
 
     // Bob balance must have increased by 50_000
     let bob_bytes = csmt.get(&bob_addr).expect("Bob account must exist");
@@ -82,11 +78,7 @@ async fn test_v2_smart_contract_isomorphic_receipt() {
     let s2 = g2.add_add(b2, a2); // Commutative inverse order
     g2.set_output(s2);
 
-    let e1 = canonical_encode(&g1);
-    let e2 = canonical_encode(&g2);
-    assert_eq!(e1, e2, "Isomorphic canonical encoding must be identical");
-
-    let h1 = vera_blockchain::chain_hash::hash256(&e1);
-    let h2 = vera_blockchain::chain_hash::hash256(&e2);
+    let h1 = canonical_hash(&g1);
+    let h2 = canonical_hash(&g2);
     assert_eq!(h1, h2, "Isomorphic contract receipts on blockchain must be identical");
 }

@@ -13,6 +13,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use ed25519_dalek::SigningKey;
 
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Events dispatched by P2P network to FullNode
 #[derive(Debug, Clone)]
 pub enum P2PEvent {
@@ -62,11 +64,13 @@ impl P2PService {
     }
 
     /// Starts TCP listener on specified port and active connection loop
-    pub async fn start(self: Arc<Self>, bind_addr: SocketAddr) -> Result<(), String> {
+    pub async fn start(self: Arc<Self>, bind_addr: SocketAddr) -> Result<SocketAddr, String> {
         let listener = TcpListener::bind(bind_addr).await
             .map_err(|e| format!("Failed to bind P2P listener on {}: {}", bind_addr, e))?;
+        let local_addr = listener.local_addr()
+            .map_err(|e| format!("Failed to get local address of P2P listener: {}", e))?;
 
-        println!("🌐 [P2P Wire] Listener listening for peer-to-peer connections on {}", bind_addr);
+        println!("🌐 [P2P Wire] Listener listening for peer-to-peer connections on {}", local_addr);
 
         // 1. Inbound connection loop
         let svc_inbound = Arc::clone(&self);
@@ -98,7 +102,7 @@ impl P2PService {
             }
         });
 
-        Ok(())
+        Ok(local_addr)
     }
 
     /// Handles an incoming TCP connection
@@ -142,8 +146,8 @@ impl P2PService {
         // Check admission
         {
             let mut pm = self.peer_manager.lock().await;
-            if pm.peers.contains_key(&seed_addr) {
-                return Ok(()); // Already connected
+            if pm.peers.values().any(|p| p.info.addr == seed_addr && !*p.cancel_tx.borrow()) {
+                return Ok(()); // Already connected and active
             }
             pm.check_admission(&seed_addr)?;
         }
@@ -175,7 +179,7 @@ impl P2PService {
         self.spawn_peer_worker(socket, seed_addr, remote_ack.node_pubkey, remote_ack.height, true).await
     }
 
-    /// Spawns async read/write worker for connected peer
+    /// Spawns async read/write worker for connected peer with synchronized cancellation and socket cleanup
     async fn spawn_peer_worker(
         &self,
         socket: TcpStream,
@@ -186,114 +190,178 @@ impl P2PService {
     ) -> Result<(), String> {
         let (mut reader, mut writer) = socket.into_split();
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<P2PPayload>(128);
-        // Keepalive: clone sender before moving to PeerManager (periodic Ping)
-        let keepalive_tx = outgoing_tx.clone();
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
 
         // Register in PeerManager
         {
             let mut pm = self.peer_manager.lock().await;
-            pm.add_peer(remote_addr, node_pubkey, height, is_outbound, outgoing_tx);
+            pm.add_peer(remote_addr, node_pubkey, height, is_outbound, outgoing_tx.clone(), cancel_tx.clone(), conn_id);
         }
 
         let _ = self.event_tx.send(P2PEvent::PeerConnected { addr: remote_addr, height }).await;
 
-        // Task 0: Keepalive — send Ping every 5s so connection never stays
-        // idle beyond P2P_SOCKET_TIMEOUT (10s). Peer responds Pong.
+        let cancel_tx_keepalive = cancel_tx.clone();
+        let keepalive_tx = outgoing_tx.clone();
+        let mut cancel_rx_keepalive = cancel_rx.clone();
+
+        // Task 0: Keepalive — send Ping every 5s with cancellation support
         tokio::spawn(async move {
             let mut nonce: u64 = 0;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                nonce = nonce.wrapping_add(1);
-                if keepalive_tx.send(P2PPayload::Ping { nonce }).await.is_err() {
-                    break; // closed channel = disconnected peer
+                tokio::select! {
+                    _ = cancel_rx_keepalive.changed() => {
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                        nonce = nonce.wrapping_add(1);
+                        if keepalive_tx.send(P2PPayload::Ping { nonce }).await.is_err() {
+                            let _ = cancel_tx_keepalive.send(true);
+                            break;
+                        }
+                    }
                 }
             }
         });
 
+        let cancel_tx_write = cancel_tx.clone();
+        let mut cancel_rx_write = cancel_rx.clone();
         let pm_ref_write = Arc::clone(&self.peer_manager);
+
+        // Task 1: Write messages from queue to TCP socket with timeout and cancellation
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel_rx_write.changed() => {
+                        break;
+                    }
+                    msg = outgoing_rx.recv() => {
+                        match msg {
+                            Some(msg) => {
+                                if let Err(e) = send_p2p_message(&mut writer, &msg).await {
+                                    eprintln!("Error sending message to peer {}: {}", remote_addr, e);
+                                    let _ = cancel_tx_write.send(true);
+                                    break;
+                                }
+                            }
+                            None => {
+                                let _ = cancel_tx_write.send(true);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Explicit TCP socket shutdown & close
+            use tokio::io::AsyncWriteExt;
+            let _ = writer.shutdown().await;
+            drop(writer);
+
+            let mut pm = pm_ref_write.lock().await;
+            pm.remove_peer_conn(&remote_addr, conn_id);
+        });
+
+        let cancel_tx_read = cancel_tx.clone();
+        let mut cancel_rx_read = cancel_rx.clone();
         let pm_ref_read = Arc::clone(&self.peer_manager);
         let event_tx_clone = self.event_tx.clone();
         let local_height_clone = Arc::clone(&self.local_height);
+        let pong_tx = outgoing_tx.clone();
 
-        // Task 1: Write messages from queue to TCP socket
-        tokio::spawn(async move {
-            while let Some(msg) = outgoing_rx.recv().await {
-                if let Err(e) = send_p2p_message(&mut writer, &msg).await {
-                    eprintln!("Error sending message to peer {}: {}", remote_addr, e);
-                    break;
-                }
-            }
-            let mut pm = pm_ref_write.lock().await;
-            pm.remove_peer(&remote_addr);
-        });
-
-        // Task 2: Read messages from TCP socket and dispatch events
+        // Task 2: Read messages from TCP socket with timeout, cancellation, and zero lock-holding during await
         tokio::spawn(async move {
             loop {
-                match recv_p2p_message(&mut reader).await {
-                    Ok(payload) => {
-                        let mut pm = pm_ref_read.lock().await;
-                        pm.touch_peer(&remote_addr, None);
-
-                        match payload {
-                            P2PPayload::Ping { nonce } => {
-                                let current_h = local_height_clone.load(Ordering::Relaxed);
-                                let pong = P2PPayload::Pong { nonce, height: current_h };
-                                if let Some(peer) = pm.peers.get(&remote_addr) {
-                                    let _ = peer.tx.send(pong).await;
-                                }
-                            }
-                            P2PPayload::Pong { height, .. } => {
-                                pm.touch_peer(&remote_addr, Some(height));
-                            }
-                            P2PPayload::NewTransaction(tx) => {
-                                let hash = tx.tx_hash();
-                                if pm.mark_seen(hash) {
-                                    drop(pm);
-                                    let _ = event_tx_clone.send(P2PEvent::NewTransaction(tx)).await;
-                                }
-                            }
-                            P2PPayload::BlockProposal(block) => {
-                                let hash = block.hash();
-                                if pm.mark_seen(hash) {
-                                    drop(pm);
-                                    let _ = event_tx_clone.send(P2PEvent::BlockProposal(block)).await;
-                                }
-                            }
-                            P2PPayload::BftVote(vote) => {
-                                let _ = event_tx_clone.send(P2PEvent::BftVote(vote)).await;
-                            }
-                            P2PPayload::MiniVote(mvote) => {
-                                let _ = event_tx_clone.send(P2PEvent::MiniValidatorVote(mvote)).await;
-                            }
-                            P2PPayload::BlockCommit(block) => {
-                                let hash = block.hash();
-                                if pm.mark_seen(hash) {
-                                    drop(pm);
-                                    let _ = event_tx_clone.send(P2PEvent::BlockCommit(block)).await;
-                                }
-                            }
-                            P2PPayload::SyncRequest(req) => {
-                                drop(pm);
-                                let _ = event_tx_clone.send(P2PEvent::SyncRequest { peer_addr: remote_addr, req }).await;
-                            }
-                            P2PPayload::SyncResponse(res) => {
-                                drop(pm);
-                                let _ = event_tx_clone.send(P2PEvent::SyncResponse { peer_addr: remote_addr, res }).await;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("P2P read closed with {}: {}", remote_addr, e);
+                tokio::select! {
+                    _ = cancel_rx_read.changed() => {
                         break;
+                    }
+                    res = recv_p2p_message(&mut reader) => {
+                        match res {
+                            Ok(payload) => {
+                                let (maybe_event, maybe_pong) = {
+                                    let mut pm = pm_ref_read.lock().await;
+                                    pm.touch_peer(&remote_addr, None);
+
+                                    match payload {
+                                        P2PPayload::Ping { nonce } => {
+                                            let current_h = local_height_clone.load(Ordering::Relaxed);
+                                            let pong = P2PPayload::Pong { nonce, height: current_h };
+                                            (None, Some(pong))
+                                        }
+                                        P2PPayload::Pong { height, .. } => {
+                                            pm.touch_peer(&remote_addr, Some(height));
+                                            (None, None)
+                                        }
+                                        P2PPayload::NewTransaction(tx) => {
+                                            let hash = tx.tx_hash();
+                                            if pm.mark_seen(hash) {
+                                                (Some(P2PEvent::NewTransaction(tx)), None)
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
+                                        P2PPayload::BlockProposal(block) => {
+                                            let hash = block.hash();
+                                            if pm.mark_seen(hash) {
+                                                (Some(P2PEvent::BlockProposal(block)), None)
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
+                                        P2PPayload::BftVote(vote) => {
+                                            (Some(P2PEvent::BftVote(vote)), None)
+                                        }
+                                        P2PPayload::MiniVote(mvote) => {
+                                            (Some(P2PEvent::MiniValidatorVote(mvote)), None)
+                                        }
+                                        P2PPayload::BlockCommit(block) => {
+                                            let hash = block.hash();
+                                            if pm.mark_seen(hash) {
+                                                (Some(P2PEvent::BlockCommit(block)), None)
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
+                                        P2PPayload::SyncRequest(req) => {
+                                            (Some(P2PEvent::SyncRequest { peer_addr: remote_addr, req }), None)
+                                        }
+                                        P2PPayload::SyncResponse(res) => {
+                                            (Some(P2PEvent::SyncResponse { peer_addr: remote_addr, res }), None)
+                                        }
+                                        _ => (None, None),
+                                    }
+                                }; // pm lock dropped immediately here!
+
+                                if let Some(pong) = maybe_pong {
+                                    let _ = pong_tx.try_send(pong);
+                                }
+
+                                if let Some(evt) = maybe_event {
+                                    let _ = event_tx_clone.send(evt).await;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("P2P read closed with {}: {}", remote_addr, e);
+                                let _ = cancel_tx_read.send(true);
+                                break;
+                            }
+                        }
                     }
                 }
             }
 
-            let mut pm = pm_ref_read.lock().await;
-            pm.remove_peer(&remote_addr);
-            let _ = event_tx_clone.send(P2PEvent::PeerDisconnected { addr: remote_addr }).await;
+            // Signal writer and keepalive to terminate
+            let _ = cancel_tx_read.send(true);
+            drop(reader);
+
+            let was_removed = {
+                let mut pm = pm_ref_read.lock().await;
+                pm.remove_peer_conn(&remote_addr, conn_id)
+            };
+            if was_removed {
+                let _ = event_tx_clone.send(P2PEvent::PeerDisconnected { addr: remote_addr }).await;
+            }
         });
 
         Ok(())

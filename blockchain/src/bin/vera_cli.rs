@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let priv_hex = args[2].strip_prefix("0x").unwrap_or(&args[2]);
             let to_hex = &args[3];
             let amount: u128 = args[4].parse()?;
-            let nonce: u64 = if args.len() > 5 { args[5].parse()? } else { 0 };
+            let user_nonce: Option<u64> = if args.len() > 5 { Some(args[5].parse()?) } else { None };
 
             let priv_bytes = hex::decode(priv_hex)?;
             let mut key_bytes = [0u8; 32];
@@ -131,6 +131,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let signing_key = SigningKey::from_bytes(&key_bytes);
 
             let to_addr = address_from_hex(to_hex)?;
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, user_nonce).await?;
 
             let tx = Transaction::new(
                 "vera-testnet-1",
@@ -144,7 +146,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let raw_tx_hex = hex::encode(tx.to_bytes());
-            let client = reqwest::Client::new();
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -163,12 +164,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let priv_hex = args[2].strip_prefix("0x").unwrap_or(&args[2]);
             let amount: u128 = args[3].parse()?;
-            let nonce: u64 = if args.len() > 4 { args[4].parse()? } else { 0 };
+            let user_nonce: Option<u64> = if args.len() > 4 { Some(args[4].parse()?) } else { None };
 
             let priv_bytes = hex::decode(priv_hex)?;
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&priv_bytes);
             let signing_key = SigningKey::from_bytes(&key_bytes);
+
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, user_nonce).await?;
 
             let tx = Transaction::new(
                 "vera-testnet-1",
@@ -182,7 +186,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let raw_tx_hex = hex::encode(tx.to_bytes());
-            let client = reqwest::Client::new();
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -201,12 +204,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let priv_hex = args[2].strip_prefix("0x").unwrap_or(&args[2]);
             let amount: u128 = args[3].parse()?;
-            let nonce: u64 = if args.len() > 4 { args[4].parse()? } else { 0 };
+            let user_nonce: Option<u64> = if args.len() > 4 { Some(args[4].parse()?) } else { None };
 
             let priv_bytes = hex::decode(priv_hex)?;
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&priv_bytes);
             let signing_key = SigningKey::from_bytes(&key_bytes);
+
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, user_nonce).await?;
 
             let tx = Transaction::new(
                 "vera-testnet-1",
@@ -220,7 +226,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let raw_tx_hex = hex::encode(tx.to_bytes());
-            let client = reqwest::Client::new();
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -238,12 +243,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             let priv_hex = args[2].strip_prefix("0x").unwrap_or(&args[2]);
-            let nonce: u64 = if args.len() > 3 { args[3].parse()? } else { 0 };
+            let user_nonce: Option<u64> = if args.len() > 3 { Some(args[3].parse()?) } else { None };
 
             let priv_bytes = hex::decode(priv_hex)?;
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&priv_bytes);
             let signing_key = SigningKey::from_bytes(&key_bytes);
+
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, user_nonce).await?;
 
             let tx = Transaction::new(
                 "vera-testnet-1",
@@ -257,7 +265,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let raw_tx_hex = hex::encode(tx.to_bytes());
-            let client = reqwest::Client::new();
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -276,12 +283,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let priv_hex = args[2].strip_prefix("0x").unwrap_or(&args[2]);
             let val_addr_hex = args[3].strip_prefix("0x").unwrap_or(&args[3]);
-            let nonce: u64 = if args.len() > 4 { args[4].parse()? } else { 0 };
+            let user_nonce: Option<u64> = if args.len() > 4 { Some(args[4].parse()?) } else { None };
 
             let priv_bytes = hex::decode(priv_hex)?;
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&priv_bytes);
             let signing_key = SigningKey::from_bytes(&key_bytes);
+
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, user_nonce).await?;
 
             let payload_data = format!("allow:0x{}", val_addr_hex).into_bytes();
 
@@ -297,7 +307,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let raw_tx_hex = hex::encode(tx.to_bytes());
-            let client = reqwest::Client::new();
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -316,12 +325,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let priv_hex = args[2].strip_prefix("0x").unwrap_or(&args[2]);
             let val_addr_hex = args[3].strip_prefix("0x").unwrap_or(&args[3]);
-            let nonce: u64 = if args.len() > 4 { args[4].parse()? } else { 0 };
+            let user_nonce: Option<u64> = if args.len() > 4 { Some(args[4].parse()?) } else { None };
 
             let priv_bytes = hex::decode(priv_hex)?;
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&priv_bytes);
             let signing_key = SigningKey::from_bytes(&key_bytes);
+
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, user_nonce).await?;
 
             let payload_data = format!("disallow:0x{}", val_addr_hex).into_bytes();
 
@@ -337,7 +349,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let raw_tx_hex = hex::encode(tx.to_bytes());
-            let client = reqwest::Client::new();
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -356,12 +367,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let priv_hex = args[2].strip_prefix("0x").unwrap_or(&args[2]);
             let new_gov_hex = args[3].strip_prefix("0x").unwrap_or(&args[3]);
-            let nonce: u64 = if args.len() > 4 { args[4].parse()? } else { 0 };
+            let user_nonce: Option<u64> = if args.len() > 4 { Some(args[4].parse()?) } else { None };
 
             let priv_bytes = hex::decode(priv_hex)?;
             let mut key_bytes = [0u8; 32];
             key_bytes.copy_from_slice(&priv_bytes);
             let signing_key = SigningKey::from_bytes(&key_bytes);
+
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, user_nonce).await?;
 
             let payload_data = format!("set_governance:0x{}", new_gov_hex).into_bytes();
 
@@ -377,7 +391,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let raw_tx_hex = hex::encode(tx.to_bytes());
-            let client = reqwest::Client::new();
             let payload = json!({
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -562,4 +575,52 @@ fn handle_rpc_tx_response(json_res: &serde_json::Value, success_msg: &str) -> Re
         println!("TX Hash: {}", json_res["result"]);
     }
     Ok(())
+}
+
+async fn resolve_nonce(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    signing_key: &SigningKey,
+    user_nonce: Option<u64>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    if let Some(n) = user_nonce {
+        return Ok(n);
+    }
+
+    let pubkey = signing_key.verifying_key().to_bytes();
+    let addr = vera_blockchain::account::address_from_pubkey(&pubkey);
+    let addr_hex = address_to_hex(&addr);
+
+    let payload = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "vera_getAccount",
+        "params": [addr_hex]
+    });
+
+    let res = client.post(rpc_url).json(&payload).send().await
+        .map_err(|e| format!("Failed to connect to RPC ({}) to query nonce: {}", rpc_url, e))?;
+    let json: serde_json::Value = res.json().await
+        .map_err(|e| format!("Failed to parse RPC response: {}", e))?;
+
+    if let Some(err) = json.get("error") {
+        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error");
+        return Err(format!("RPC error querying account nonce: {}", msg).into());
+    }
+
+    let nonce_val = &json["result"]["nonce"];
+    let nonce = match nonce_val {
+        serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| "Invalid numeric nonce".to_string())?,
+        serde_json::Value::String(s) => {
+            if s.starts_with("0x") {
+                u64::from_str_radix(s.trim_start_matches("0x"), 16)?
+            } else {
+                s.parse::<u64>()?
+            }
+        }
+        _ => return Err(format!("Invalid or missing nonce in RPC response for account {}", addr_hex).into()),
+    };
+
+    println!("ℹ️ Nonce not provided: auto-fetched current nonce {} from network", nonce);
+    Ok(nonce)
 }

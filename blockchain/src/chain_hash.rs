@@ -42,7 +42,7 @@ mod tests {
         let expected = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
         assert_eq!(hex::encode(hash256(b"")), expected);
 
-        let h = ChainHasher::new();
+        let mut h = ChainHasher::new();
         assert_eq!(hex::encode(h.finalize()), expected);
     }
 
