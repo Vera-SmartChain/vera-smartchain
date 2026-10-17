@@ -1,141 +1,204 @@
 # ⚖️ Running a Validator on VERA SmartChain
 
-This guide details the complete operational instructions, security standards, and deployment procedures for running a validator node on the **VERA SmartChain**.
+This document provides the complete, deterministic guide for deploying, onboarding, and operating a validator node on the **VERA SmartChain**.
 
 ---
 
-## 🏛️ Consensus Model & Economic Rules
+## 🏛️ Consensus Model & Economic Specifications
 
-VERA SmartChain utilizes a high-performance **Byzantine Fault Tolerant Proof-of-Stake (BFT-PoS)** consensus engine:
-- **Block Authorship:** Rotates deterministically across the active validator set.
-- **Commit Rule:** A block is finalized when it collects Ed25519 cryptographic signatures representing at least **2/3 + 1** of active network stake.
-- **State Authenticity:** State transitions and receipts are authenticated using **BLAKE3** cryptographic hashing and Compact Sparse Merkle Trees (CSMT).
-- **Minimum Stake Requirement:**
-  - **Mainnet Baseline:** `10,000 VERA` (`10000000000000000000000` wei) minimum bonded stake required to propose and validate blocks.
-  - **Testnet-1 Environment:** Configured to `32 VERA` (`32000000000000000000` wei) with a 5-block unbonding window to streamline developer onboarding, node operator testing, and automated integration pipelines.
-- **Liveness Slashing:** Validators that fail to vote for 10 consecutive rounds (`max_missed_blocks = 10`) are automatically jailed and removed from the active consensus schedule until unjailed by governance.
+VERA SmartChain operates using an energy-efficient **Byzantine Fault Tolerant Proof-of-Stake (BFT-PoS)** consensus architecture:
+- **Block Authorship:** Rotates deterministically across active validators.
+- **Commit Rule:** Blocks are irreversibly committed upon collecting Ed25519 signatures from at least **2/3 + 1** of active network stake.
+- **State Authenticity:** State transitions and receipts are verified through **BLAKE3** hashing and Compact Sparse Merkle Tree (CSMT) cryptographic proofs.
+- **Minimum Bonded Stake:** `32 VERA` (`32000000000000000000` wei) on Testnet-1 with a 5-block unbonding period.
+- **Liveness Slashing:** A validator missing 10 consecutive blocks (`max_missed_blocks = 10`) is automatically jailed and incurs a 1% slash.
 
 ---
 
-## 💧 Obtaining Testnet Stake & Allowlist Access
+## 🖥️ Server Requirements
 
-Because the public testnet faucet distributes 1.0 VERA per 24 hours per address (to protect public testnet liquidity against automated exhaustion), new testnet validators receive their initial staking balance through authorized onboarding:
-
-1. **Generate your Validator Keys:**
-   ```bash
-   ./vera_cli keygen
-   ```
-   Save the private key (`/etc/vera/validator_key.hex`, mode `0600`, owned by service user `vera`). Note your public key (`0x...` or 32-byte hex) and derived on-chain address (`0x...`).
-
-2. **Request Validator Allowlist & Staking Allocation:**
-   - Submit your validator address and public key to the VERA Testnet Governance:
-     - **Email:** `governance@verachain.cloud` or via official Discord / Telegram validator onboarding channels.
-   - The Testnet Governance Account (`0xd12949512c92d3e70be1789b3f086044c4483205a20f29b34b066396c00f0ea5`) executes:
-     - Allowlist transaction: `allow:<VALIDATOR_ADDRESS>`
-     - Initial staking grant (32+ VERA) directly to your validator address.
-
-3. **Bond Your Validator Stake:**
-   Once funded and allowlisted, submit your on-chain bond transaction using `vera_cli`:
-   ```bash
-   # Syntax: ./vera_cli stake <private_key_hex> <amount_wei>
-   ./vera_cli stake <YOUR_PRIVATE_KEY_HEX> 32000000000000000000
-   ```
-   The transaction will be committed in the next block, dynamically adding your node to the active validator set.
+- **Operating System:** Ubuntu 24.04 LTS x86_64
+- **Compute:** 2 vCPU
+- **Memory:** 4 GB RAM
+- **Storage:** 40 GB NVMe / SSD
+- **Network:** Public IPv4, root or sudo privileges
 
 ---
 
-## 🖥️ System Requirements
+## 🚀 Deterministic Onboarding Guide (Steps 1–9)
 
-| Resource | Minimum | Recommended Production |
-| :--- | :--- | :--- |
-| **CPU** | 4 Cores x86-64 | 8 Cores (AMD EPYC or Intel Xeon) |
-| **RAM** | 4 GB | 8 GB DDR4/DDR5 |
-| **Disk** | 40 GB NVMe SSD | 200 GB NVMe PCIe 4.0 |
-| **Network**| 50 Mbps symmetric | 1 Gbps symmetric unmetered |
-| **OS** | Ubuntu 22.04 / 24.04 LTS | Ubuntu 24.04 LTS Minimal |
-
----
-
-## 🚀 Installation & Service Configuration
-
-### 1. Install Release Package
-
-Download and verify the official release package:
+### Step 1: Server Preparation & Firewall
+Install required system packages, enforce the security firewall, and synchronize system time:
 ```bash
-mkdir -p /var/lib/vera/releases && cd /var/lib/vera/releases
-# Download release package (v0.2.1-testnet)
-RELEASE_URL="https://github.com/Vera-SmartChain/vera-node-releases/releases/download/v0.2.1-testnet"
-for f in install.sh SHA256SUMS SHA256SUMS.sig vera-release.pub testnet-genesis.json vera_node vera_cli vera-node.service; do
-    curl -LO "${RELEASE_URL}/${f}"
-done
+sudo apt update && sudo apt install -y chrony wget gnupg ufw
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 22/tcp
+sudo ufw allow 26656/tcp
+sudo ufw --force enable
+chronyc tracking
+```
+Expected output from `chronyc tracking`:
+```text
+Leap status     : Normal
+```
+> **Security Requirement:** No inbound port other than SSH (22) and 26656 is needed; never expose 8545.
+> **LXC Container Note:** Inside an LXC container, system clock synchronization is managed by the host. Ensure the host system synchronizes time using NTP or chrony, as the VERA wire protocol strictly terminates peer handshakes with clock drift exceeding 30 seconds.
 
-# Cryptographically verify the release
+---
+
+### Step 2: Install Regular Node
+Download the release bundle, verify cryptographic signatures, and run the automated installer:
+```bash
+mkdir -p ~/vera-testnet && cd ~/vera-testnet
+RELEASE_URL="https://github.com/Vera-SmartChain/vera-node-releases/releases/download/v0.2.3-testnet"
+for f in install.sh SHA256SUMS SHA256SUMS.sig vera-release.pub testnet-genesis.json vera_node vera_cli vera-node.service vera-validator.service; do
+    wget -q --show-progress "${RELEASE_URL}/${f}"
+done
 gpg --import vera-release.pub
 gpg --verify SHA256SUMS.sig SHA256SUMS
 sha256sum -c SHA256SUMS
-
-# Run automated installer
-sudo bash install.sh
-```
-
-### 2. Configure Systemd Service (`/etc/systemd/system/vera-validator.service`)
-
-```ini
-[Unit]
-Description=VERA SmartChain Validator Node
-After=network.target
-
-[Service]
-Type=simple
-User=vera
-Group=vera
-WorkingDirectory=/var/lib/vera
-ExecStart=/usr/local/bin/vera_node \
-  --validator \
-  --key-file /etc/vera/validator_key.hex \
-  --genesis /etc/vera/testnet-genesis.json \
-  --data-dir /var/lib/vera/data \
-  --rpc-port 8545 \
-  --p2p-port 26656 \
-  --seed-peers 2.25.216.206:26656,31.97.93.163:26656
-Restart=always
-RestartSec=3
-LimitNOFILE=65535
-
-# Security Sandboxing
-NoNewPrivileges=yes
-ProtectSystem=strict
-ProtectHome=yes
-ReadWritePaths=/var/lib/vera /var/log/vera
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### 3. Start & Monitor Node
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now vera-validator
-
-# Check service status
-sudo systemctl status vera-validator
-
-# Follow live consensus logs
-journalctl -u vera-validator -f
+chmod +x install.sh && sudo ./install.sh
+sudo systemctl enable --now vera-node
 ```
 
 ---
 
-## 🔍 Validation & Health Checks
-
-Verify your node's synchronization and block production:
-
+### Step 3: Wait for Synchronization
+Compare local block height against the remote network RPC until synchronized:
 ```bash
-# Check block height
-curl -s http://127.0.0.1:8545 -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}'
-
-# Query validator set and active stakes
-./vera_cli query-validators http://127.0.0.1:8545
+vera_cli syncwait
 ```
+Expected output:
+```text
+SYNCED at block #N
+```
+
+---
+
+### Step 4: Generate Validator Key
+Generate a dedicated Ed25519 keypair for block signing:
+```bash
+sudo vera_cli keygen --out /etc/vera/validator_key.hex
+```
+Expected output:
+```text
+Address:    0x...
+Public Key: 0x...
+```
+The private key is recorded to `/etc/vera/validator_key.hex` with permissions `0600` (owned by `vera:vera`) and is never printed to logs or standard output. The command terminates with non-zero exit code if the file already exists.
+
+---
+
+### Step 5: Apply for Validator Onboarding
+Generate the cryptographically signed Ed25519 application block:
+```bash
+sudo vera_cli apply-validator --key-file /etc/vera/validator_key.hex --operator "@your_github_username"
+```
+Expected output:
+```text
+-----BEGIN VERA VALIDATOR APPLICATION-----
+chain_id: vera-testnet-1
+address: 0x...
+public_key: 0x...
+operator: @your_github_username
+timestamp: 179...
+signature: 0x...
+-----END VERA VALIDATOR APPLICATION-----
+```
+Submit the application block by creating a GitHub issue:
+- Web: [Validator Application Form](https://github.com/Vera-SmartChain/vera-node-releases/issues/new?template=validator-application.yml)
+- CLI:
+```bash
+gh issue create --repo Vera-SmartChain/vera-node-releases --title "Validator Application: @your_github_username" --body "<application_block>"
+```
+
+---
+
+### Step 6: Governance Authorization
+Network governance validates the application on Node 1 via `sudo vera-approve-validator '<block>'`. The tool validates signature authenticity, confirms chain ID, checks that timestamp is within 7 days, executes on-chain allowlisting, and funds 33 VERA (32 VERA bond + 1 VERA gas) from treasury.
+
+Expected response on your GitHub issue:
+```text
+Hello @your_github_username! Your validator application for address 0x... has been approved and funded with 33 VERA.
+- Allowlist TX: 0x...
+- Funding TX:   0x...
+Proceed to Step 7 (enable validator service) and Step 8 (stake 32 VERA).
+```
+
+---
+
+### Step 7: Enable Validator Service
+Switch service units and verify synchronization:
+```bash
+sudo systemctl disable --now vera-node && sudo systemctl enable --now vera-validator
+vera_cli syncwait
+```
+Expected output:
+```text
+SYNCED at block #N
+```
+
+---
+
+### Step 8: Bond Stake
+Bond 32 VERA into the active consensus set:
+```bash
+sudo vera_cli stake --key-file /etc/vera/validator_key.hex 32000000000000000000
+```
+Expected output:
+```text
+🔒 Staking Transaction Broadcast!
+TX Hash: "0x..."
+```
+
+---
+
+### Step 9: Confirm Active Validator Status
+Verify your node's status in the active validator set:
+```bash
+sudo vera_cli validator-status --key-file /etc/vera/validator_key.hex
+```
+Expected output:
+```text
+Validator:     0x...
+Status:        ACTIVE stake=32 VERA jailed=false
+Missed Blocks: 0
+Active Peers:  1
+
+ACTIVE stake=32 VERA jailed=false
+```
+
+---
+
+## 🔧 Operational Procedures
+
+### Unjailing After Downtime
+A validator missing 10 consecutive blocks enters jailed status and is slashed 1% (stake reduced to 31.68 VERA). To restore active status, top up the minimum 32 VERA stake and unjail:
+```bash
+sudo vera_cli stake --key-file /etc/vera/validator_key.hex 500000000000000000
+sudo vera_cli unjail --key-file /etc/vera/validator_key.hex
+```
+Expected output:
+```text
+⚖️ Unjail Transaction Broadcast!
+TX Hash: "0x..."
+```
+
+### Voluntary Exit (Unstaking)
+To unbond your stake and exit the validator set:
+```bash
+sudo vera_cli unstake --key-file /etc/vera/validator_key.hex 32000000000000000000
+```
+The unbonding queue releases bonded funds after 5 blocks. After the 5th block, stop the service:
+```bash
+sudo systemctl disable --now vera-validator
+```
+
+### Upgrading Node Binary
+Download and cryptographically verify the new release bundle, then execute:
+```bash
+sudo ./install.sh
+sudo systemctl restart vera-validator
+```
+The installer automatically records the new binary hash into `/etc/vera/expected_binary_sha256`.

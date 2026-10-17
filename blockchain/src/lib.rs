@@ -22,3 +22,5 @@ pub use ed25519_dalek;
 pub mod evm;
 pub mod chain_hash;
 pub use chain_hash::{hash256, ChainHasher};
+pub mod validator_application;
+
