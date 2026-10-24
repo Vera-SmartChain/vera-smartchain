@@ -1,6 +1,6 @@
 # 📊 VERA SmartChain ($VERA) — Official Tokenomics
 
-**Perpetual Recirculation Economic Model Backed by Real Utility**
+**Economic Model Backed by Real Utility**
 
 ---
 
@@ -11,17 +11,19 @@
 | **Asset Name** | VERA SmartChain Native Coin |
 | **Ticker** | **$VERA** |
 | **Decimal Precision** | 18 decimals (1 VERA = 10¹⁸ wei) |
-| **Total Hard Cap** | **100,000,000 VERA** (100 Million) — immutably configured at Genesis |
-| **Economic Model** | Deflationary perpetual recirculation with partial fee burning |
-| **Consensus Engine** | BFT Proof-of-Stake with 2/3 + 1 supermajority commitment |
+| **Total Hard Cap** | **100,000,000 VERA** (100 Million) — *planned for mainnet, may change* |
+| **Economic Model** | Fee split 70/15/15 (implemented on the testnet) |
+| **Consensus Engine** | Tendermint BFT Proof-of-Stake with 2/3 + 1 supermajority commitment |
 | **Signature Scheme** | Ed25519 (256-bit Edwards Curve) |
 | **State Hashing** | BLAKE3 (256-bit cryptographic tree hashing) |
-| **Target Block Time** | 12 seconds |
-| **Finality** | Immediate deterministic sub-second BFT finality (zero probabilistic forks) |
+| **Finality** | Immediate deterministic BFT finality (zero probabilistic forks; measured median finality 554 ms) |
 
 ---
 
-## 2. Genesis Allocation Breakdown
+## 2. Genesis Allocation Breakdown *(Planned for Mainnet, May Change)*
+
+> [!NOTE]
+> The allocation breakdown below is planned for mainnet and may change prior to mainnet launch. The current public testnet operates with a minimal test allocation.
 
 | Category | Share | Allocation | Release Schedule & Vesting |
 | :--- | :---: | :---: | :--- |
@@ -33,21 +35,21 @@
 
 ---
 
-## 3. Perpetual Recirculation Mechanism (70 / 15 / 15)
+## 3. Fee Split Mechanism (70 / 15 / 15)
 
 Every transaction fee and smart contract gas cost processed on the network is split deterministically:
 
-1. **70% to Block Proposer & Validators:** Directly rewards active nodes securing the consensus.
-2. **15% Protocol Burn:** Permanently subtracted from the circulating supply, applying organic deflationary pressure.
-3. **15% Ecosystem Treasury:** Funds ongoing development, public infrastructure maintenance, and developer grants.
+1. **70% to Block Proposer:** Directly rewards the active proposer node securing the consensus.
+2. **15% Stability Pool:** Sent to the stability reserve (`0x00000000000000000000000000000000000057ab`).
+3. **15% Protocol Burn:** Sent to the burn address `0x000000000000000000000000000000000000dead`, which no one controls. There is no block reward or inflation.
 
 ---
 
 ## 4. Staking & Slashing Parameters
 
-- **Mainnet Minimum Validator Stake:** `10,000 VERA`
-- **Testnet-1 Minimum Validator Stake:** `32 VERA` (to enable accessible testing)
+- **Mainnet Minimum Validator Stake:** `10,000 VERA` (planned for mainnet, may change)
+- **Testnet-1 Minimum Validator Stake:** `32 VERA` (up to 50 validators via governance allowlist)
 - **Unbonding Period:**
-  - Mainnet: 50,400 blocks (~7 days)
-  - Testnet-1: 5 blocks (~60 seconds)
-- **Liveness Slashing:** Missing 10 consecutive consensus rounds results in automatic jailing.
+  - Mainnet: to be defined before mainnet
+  - Testnet-1: 5 blocks
+- **Liveness Slashing:** Missing 10 blocks results in jailing and a 1% slash (slashed stake is transferred to the stability pool).

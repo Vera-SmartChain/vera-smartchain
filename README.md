@@ -3,10 +3,10 @@
 The official open-source core repository for **Vera SmartChain**.
 
 Vera SmartChain is an enterprise-grade Layer-1 blockchain engineered in Rust. Consensus and state verification use the industry-standard BLAKE3 hash function for high throughput and provable security. Key architectural components include:
-- **Tendermint/PBFT-style Proof-of-Stake Consensus:** 12-second block intervals with deterministic BFT commit, dynamic validator staking, and unbonding.
+- **Tendermint/PBFT-style Proof-of-Stake Consensus:** Deterministic BFT commit (blocks produced on transaction intake), dynamic validator staking, and unbonding.
 - **Compact Sparse Merkle Tree (CSMT):** High-throughput authenticated key-value state commitment with cryptographic non-existence proofs.
 - **Native EVM Execution:** Full Ethereum Virtual Machine compatibility powered by [`revm`](https://github.com/bluealloy/revm).
-- **VERA Engine v2:** AI-Native execution engine featuring canonical SSA computation graphs, isomorphic normalizers, and high-speed ARX-64 hashing.
+- **VERA Engine v2:** Execution engine featuring canonical SSA computation graphs, isomorphic normalizers, and high-speed ARX-64 hashing.
 
 ---
 
@@ -21,7 +21,7 @@ This repository is organized as a Rust workspace:
   - `csmt`: Compact Sparse Merkle Tree state storage and verification.
   - `state_transition`: Transaction routing (native transfers, EVM contracts, and governance).
   - `rpc`: Ethereum-compatible JSON-RPC 2.0 interface (`eth_*`, `net_*`, `web3_*`).
-- [`vera-engine-v2/`](vera-engine-v2/): AI-Native execution engine:
+- [`vera-engine-v2/`](vera-engine-v2/): Execution engine:
   - `graph`: Static Single Assignment (SSA) computation graphs with verified invariants.
   - `canonical`: Isomorphic graph normalizer (constant folding, dead-code elimination, CSE).
   - `vera_hash`: Experimental ARX-64 research hash function with Oct-Tree parallel folding (not used in consensus; consensus uses BLAKE3).
@@ -62,7 +62,7 @@ Run crate-specific tests:
 # Test blockchain consensus, EVM, and state transitions
 cargo test -p vera-blockchain
 
-# Test AI-native engine, isomorphism, and cryptographic hashing
+# Test engine, isomorphism, and cryptographic hashing
 cargo test -p vera-engine-v2
 ```
 

@@ -12,12 +12,11 @@ This document describes the parameters and cryptographic state of the **VERA Sma
 | **P2P Chain ID** | `vera-testnet-1` |
 | **EVM Chain ID** | `83721` (`0x14709`) |
 | **Genesis Timestamp**| `1790520233` (Sun Sep 27 2026 14:43:53 UTC) |
-| **Target Block Time** | 12 seconds |
 | **Consensus Engine** | BFT Proof-of-Stake |
 | **State Hashing** | BLAKE3 (Compact Sparse Merkle Tree) |
 | **Minimum Stake** | `32 VERA` (`32000000000000000000` wei) |
 | **Unbonding Window** | `5` blocks |
-| **Max Missed Blocks**| `10` rounds before jailing |
+| **Max Missed Blocks**| `10` blocks before jailing |
 | **Permissioned Mode** | `true` (Testnet sybil protection via on-chain governance allowlist) |
 | **Governance Account**| `0xd12949512c92d3e70be1789b3f086044c4483205a20f29b34b066396c00f0ea5` |
 
