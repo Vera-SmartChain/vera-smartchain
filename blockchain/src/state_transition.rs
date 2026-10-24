@@ -4,6 +4,97 @@ use crate::csmt::CSMT;
 use crate::transaction::Transaction;
 use vera_engine_v2::{ComputationGraph, canonical_encode};
 
+// ---------------------------------------------------------------------------------------
+// Signature verification cache + parallel pre-verification.
+//
+// A tx is usually verified at mempool admission and then again inside every block
+// execution (build / validate / apply). The cache remembers txs whose signature already
+// verified, keyed so the key fixes EVERY input of `verify_signature`:
+//   - native tx: tx_hash() = H(signing_hash || signature), and signing_hash covers
+//     chain_id, public_key, sender, nonce, to, amount, gas and program;
+//   - EVM tx: tx_hash() is keccak(raw) only, while verify_signature also checks the struct
+//     fields against the raw payload (the v0.2.4.2 fix), so the key is the hash of the whole
+//     serialized struct instead.
+// Signatures of a block that are not in the cache are verified in parallel before the
+// sequential execution; a failure is not cached, so the sequential path re-verifies it and
+// returns exactly the same error as before.
+// ---------------------------------------------------------------------------------------
+const PARALLEL_VERIFY_MIN_TXS: usize = 64;
+
+fn verified_sigs() -> &'static std::sync::Mutex<std::collections::HashSet<[u8; 32]>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn sig_cache_key(tx: &Transaction) -> [u8; 32] {
+    if tx.raw_evm.is_some() {
+        crate::chain_hash::hash256(&tx.to_bytes())
+    } else {
+        tx.tx_hash()
+    }
+}
+
+fn remember_verified(keys: &[[u8; 32]]) {
+    if let Ok(mut c) = verified_sigs().lock() {
+        if c.len() + keys.len() > crate::hw::profile().signature_cache_entries() {
+            c.clear();
+        }
+        c.extend(keys.iter().copied());
+    }
+}
+
+/// Empties the signature cache (benchmarks and tests only).
+#[doc(hidden)]
+pub fn clear_signature_cache() {
+    if let Ok(mut c) = verified_sigs().lock() {
+        c.clear();
+    }
+}
+
+/// verify_signature(), skipped when the same tx (same key) already verified.
+pub fn verify_signature_cached(tx: &Transaction) -> Result<(), String> {
+    let key = sig_cache_key(tx);
+    if verified_sigs().lock().map_or(false, |c| c.contains(&key)) {
+        return Ok(());
+    }
+    tx.verify_signature()?;
+    remember_verified(&[key]);
+    Ok(())
+}
+
+/// Verifies, on all cores, the signatures of `txs` not verified yet, and caches the valid
+/// ones. Never fails: invalid txs are left for the sequential path to reject as before.
+pub fn preverify_signatures(txs: &[Transaction]) {
+    let pending: Vec<(&Transaction, [u8; 32])> = {
+        let c = match verified_sigs().lock() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        txs.iter()
+            .map(|t| (t, sig_cache_key(t)))
+            .filter(|(_, k)| !c.contains(k))
+            .collect()
+    };
+    if pending.len() < PARALLEL_VERIFY_MIN_TXS {
+        return; // not worth the threads; verified sequentially
+    }
+    let threads = crate::hw::profile().threads;
+    if threads == 1 {
+        return; // single core: the sequential path verifies them, no thread overhead
+    }
+    let chunk = (pending.len() + threads - 1) / threads;
+    let ok: Vec<[u8; 32]> = std::thread::scope(|scope| {
+        let handles: Vec<_> = pending
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || {
+                part.iter().filter(|(t, _)| t.verify_signature().is_ok()).map(|(_, k)| *k).collect::<Vec<_>>()
+            }))
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    });
+    remember_verified(&ok);
+}
+
 pub const BASE_TX_GAS: u64 = 21_000;
 pub const GAS_PER_INSTRUCTION: u64 = 100;
 
@@ -74,7 +165,7 @@ impl StateTransitionEngine {
         evm_chain_id: u64,
     ) -> Result<ExecutionReceipt, String> {
         // 1. Cryptographic Signature Verification and Cross-Chain Shielding
-        tx.verify_signature()?;
+        verify_signature_cached(tx)?;
 
         // 2. Protection against Cross-Chain Replay
         if !tx.chain_id.starts_with("vera-") {
@@ -459,6 +550,7 @@ impl StateTransitionEngine {
             }
         }
 
+        preverify_signatures(&block.transactions);
         let mut receipts = Vec::with_capacity(block.transactions.len());
         let mut applied = Vec::with_capacity(block.transactions.len());
 
@@ -485,6 +577,16 @@ impl StateTransitionEngine {
         block: &Block,
         evm_chain_id: u64,
     ) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
+        Self::validate_block_strict_with_receipts(csmt, block, evm_chain_id).await.map(|(roots, _)| roots)
+    }
+
+    /// `validate_block_strict` that also returns the receipts it computed (a compact
+    /// proposal arrives without them).
+    pub async fn validate_block_strict_with_receipts(
+        csmt: &mut CSMT,
+        block: &Block,
+        evm_chain_id: u64,
+    ) -> Result<(([u8; 32], [u8; 32], [u8; 32]), Vec<ExecutionReceipt>), String> {
         // Validation of previous commits root in header
         if block.header.height > 1 {
             let expected_commit_hash = Block::compute_commits_root(&block.last_commit);
@@ -553,6 +655,7 @@ impl StateTransitionEngine {
             }
         }
 
+        preverify_signatures(&block.transactions);
         let mut receipts = Vec::with_capacity(block.transactions.len());
         for tx in &block.transactions {
             let receipt = Self::execute_transaction_with_context(csmt, tx, block.header.proposer, block.header.height, block.header.timestamp, evm_chain_id).await?;
@@ -561,7 +664,7 @@ impl StateTransitionEngine {
         let state_root = csmt.root();
         let tx_root = Block::compute_tx_root(&block.transactions);
         let receipts_root = Block::compute_receipts_root(&receipts);
-        Ok((state_root, tx_root, receipts_root))
+        Ok(((state_root, tx_root, receipts_root), receipts))
     }
 }
 

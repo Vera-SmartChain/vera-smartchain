@@ -4,6 +4,8 @@ use super::messages::*;
 
 /// Maximum P2P network frame size (4 MB) protecting against RAM exhaustion attacks
 pub const MAX_P2P_FRAME_SIZE: usize = 4 * 1024 * 1024;
+/// Frames at least this large log their encode/decode time (block-sized messages).
+const TIMING_LOG_MIN_FRAME: usize = 256 * 1024;
 
 /// Maximum timeout for receiving a full frame (10 seconds) against Slowloris
 pub const P2P_SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
@@ -57,15 +59,18 @@ pub async fn write_raw_frame<W: AsyncWrite + Unpin>(
     msg_type: u8,
     payload: &[u8],
 ) -> Result<(), String> {
-    let write_future = async {
-        let frame_len = 1 + payload.len();
-        if frame_len > MAX_P2P_FRAME_SIZE {
-            return Err(format!(
-                "Attempted to send P2P frame exceeding 4MB: {} bytes",
-                frame_len
-            ));
-        }
+    let frame_len = 1 + payload.len();
+    if frame_len > MAX_P2P_FRAME_SIZE {
+        eprintln!(
+            "❌ [P2P Wire] Attempted to send raw frame type 0x{:02x} exceeding 4MB limit: {} bytes (max: {} bytes). Frame dropped without sending.",
+            msg_type,
+            frame_len,
+            MAX_P2P_FRAME_SIZE
+        );
+        return Ok(());
+    }
 
+    let write_future = async {
         let len_bytes = (frame_len as u32).to_be_bytes();
         writer.write_all(&len_bytes).await
             .map_err(|e| format!("Failed to write P2P frame length: {}", e))?;
@@ -93,8 +98,22 @@ pub async fn send_p2p_message<W: AsyncWrite + Unpin>(
     message: &P2PPayload,
 ) -> Result<(), String> {
     let msg_type = message.msg_type();
+    let t_enc = std::time::Instant::now();
     let serialized = serde_json::to_vec(message)
         .map_err(|e| format!("Failed to serialize P2P message: {}", e))?;
+    if serialized.len() >= TIMING_LOG_MIN_FRAME {
+        println!("⏱️ [P2P] encode {} {} KB in {:.1} ms", message.type_name(), serialized.len() / 1024, t_enc.elapsed().as_secs_f64() * 1000.0);
+    }
+    let frame_len = 1 + serialized.len();
+    if frame_len > MAX_P2P_FRAME_SIZE {
+        eprintln!(
+            "❌ [P2P Wire] Attempted to send {} frame exceeding 4MB limit: {} bytes (max: {} bytes). Frame dropped without sending.",
+            message.type_name(),
+            frame_len,
+            MAX_P2P_FRAME_SIZE
+        );
+        return Ok(());
+    }
     write_raw_frame(writer, msg_type, &serialized).await
 }
 
@@ -103,8 +122,12 @@ pub async fn recv_p2p_message<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> Result<P2PPayload, String> {
     let (_msg_type, payload) = read_raw_frame(reader).await?;
+    let t_dec = std::time::Instant::now();
     let message: P2PPayload = serde_json::from_slice(&payload)
         .map_err(|e| format!("Failed to deserialize P2P payload: {}", e))?;
+    if payload.len() >= TIMING_LOG_MIN_FRAME {
+        println!("⏱️ [P2P] decode {} {} KB in {:.1} ms", message.type_name(), payload.len() / 1024, t_dec.elapsed().as_secs_f64() * 1000.0);
+    }
     Ok(message)
 }
 

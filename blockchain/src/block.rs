@@ -52,6 +52,14 @@ pub struct Block {
     #[serde(default)]
     pub last_commit: Vec<ValidatorCommit>,
     pub validator_signatures: Vec<ValidatorCommit>,
+    /// Round whose precommits form `validator_signatures` (this block's commit
+    /// certificate). Always 0 before Tendermint activation. Not part of the block hash:
+    /// the precommit signatures themselves bind (height, round, block hash).
+    #[serde(default)]
+    pub commit_round: u64,
+    /// Round of `last_commit` (the previous block's commit certificate).
+    #[serde(default)]
+    pub last_commit_round: u64,
 }
 
 impl Block {
@@ -66,6 +74,8 @@ impl Block {
             receipts,
             last_commit: Vec::new(),
             validator_signatures: Vec::new(),
+            commit_round: 0,
+            last_commit_round: 0,
         }
     }
 

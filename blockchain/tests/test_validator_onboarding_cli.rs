@@ -3,8 +3,10 @@ use rand::rngs::OsRng;
 use std::fs;
 use std::path::Path;
 use vera_blockchain::validator_application::{
-    is_address_in_allowlist, parse_validator_status_from_json, read_key_from_file_or_hex, ValidatorApplication,
+    is_address_in_allowlist, is_version_newer, parse_validator_status_from_json, read_key_from_file_or_hex,
+    ValidatorApplication,
 };
+
 
 #[test]
 fn test_validator_application_roundtrip_and_verification() {
@@ -257,4 +259,32 @@ fn test_allowlist_rejection_and_status_parsing_with_real_rpc_json() {
     assert_eq!(status_jailed.state, "JAILED");
     assert!(status_jailed.is_jailed);
 }
+
+#[test]
+fn test_version_comparison_logic() {
+    // Newer patch / sub-patch
+    assert!(is_version_newer("v0.2.4.1-testnet", "v0.2.4-testnet"));
+    assert!(is_version_newer("0.2.4.1-testnet", "0.2.4-testnet"));
+    assert!(is_version_newer("v0.2.5-testnet", "v0.2.4.1-testnet"));
+    assert!(is_version_newer("v0.2.5-testnet", "v0.2.4-testnet"));
+    assert!(is_version_newer("0.2.5-testnet", "0.2.4-testnet"));
+    // Newer minor
+    assert!(is_version_newer("v0.3.0-testnet", "v0.2.4-testnet"));
+    // Newer major
+    assert!(is_version_newer("v1.0.0", "v0.2.4-testnet"));
+
+    // Equal versions
+    assert!(!is_version_newer("v0.2.4-testnet", "v0.2.4-testnet"));
+    assert!(!is_version_newer("0.2.4-testnet", "0.2.4-testnet"));
+    assert!(!is_version_newer("v0.2.4.1-testnet", "v0.2.4.1-testnet"));
+
+    // Older versions
+    assert!(!is_version_newer("v0.2.3-testnet", "v0.2.4-testnet"));
+    assert!(!is_version_newer("v0.1.0", "v0.2.4-testnet"));
+
+    // Malformed strings
+    assert!(!is_version_newer("invalid", "v0.2.4-testnet"));
+    assert!(!is_version_newer("v0.2.5-testnet", "invalid"));
+}
+
 

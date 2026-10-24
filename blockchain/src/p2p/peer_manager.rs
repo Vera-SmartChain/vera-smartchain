@@ -9,6 +9,19 @@ use super::messages::*;
 pub const MAX_TOTAL_PEERS: usize = 64;
 pub const MAX_PEERS_PER_IP: usize = 4;
 pub const BAN_DURATION_SECS: u64 = 3600; // 1 hour ban in case of attack
+/// A discovered validator is dialed first only by the side with the lower pubkey, so two
+/// validators that find each other do not open crossed connections that evict each
+/// other (pubkey dedup). The higher side dials too once this grace period has passed
+/// without a connection (e.g. the lower side cannot reach it through NAT).
+pub const DISCOVERY_DIAL_GRACE_SECS: u64 = 60;
+
+/// A validator learned through a signed `PeerAnnounce`.
+#[derive(Debug, Clone)]
+pub struct DiscoveredPeer {
+    pub addr: SocketAddr,
+    pub announce: PeerAnnounce,
+    pub first_seen: std::time::Instant,
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -18,11 +31,16 @@ pub struct PeerInfo {
     pub last_seen: u64,
     pub connected_at: u64,
     pub is_outbound: bool,
+    /// Capability bits from the peer's handshake (0 for nodes older than v0.2.5).
+    pub features: u32,
 }
 
 pub struct PeerHandle {
     pub info: PeerInfo,
     pub tx: mpsc::Sender<P2PPayload>,
+    /// Consensus messages go here when set: the writer drains it before `tx`, so a
+    /// vote never waits behind thousands of gossiped transactions.
+    pub prio_tx: Option<mpsc::Sender<P2PPayload>>,
     pub cancel_tx: tokio::sync::watch::Sender<bool>,
     pub conn_id: u64,
 }
@@ -35,6 +53,15 @@ pub struct PeerManager {
     pub seed_nodes: Vec<SocketAddr>,
     pub seen_hashes: HashSet<[u8; 32]>,
     pub seen_hashes_order: VecDeque<[u8; 32]>,
+    /// Validators learned via PeerAnnounce, keyed by validator pubkey (latest announce wins).
+    pub discovered: HashMap<[u8; 32], DiscoveredPeer>,
+    /// Our own IP as reported by peers (AddrHint), with the number of reports.
+    pub observed_ips: HashMap<IpAddr, u32>,
+    /// Our P2P listen port, set when the listener starts.
+    pub listen_port: u16,
+    /// Addresses that turned out to be ourselves (e.g. our own IP listed as a seed):
+    /// never dialed again.
+    pub self_addrs: HashSet<SocketAddr>,
 }
 
 impl PeerManager {
@@ -47,6 +74,79 @@ impl PeerManager {
             seed_nodes: seeds,
             seen_hashes: HashSet::new(),
             seen_hashes_order: VecDeque::new(),
+            discovered: HashMap::new(),
+            observed_ips: HashMap::new(),
+            listen_port: 0,
+            self_addrs: HashSet::new(),
+        }
+    }
+
+    pub fn set_features(&mut self, addr: &SocketAddr, features: u32) {
+        if let Some(peer) = self.peers.get_mut(addr) {
+            peer.info.features = features;
+        }
+    }
+
+    pub fn is_connected_to(&self, node_pubkey: &[u8; 32]) -> bool {
+        self.peers.values().any(|p| &p.info.node_pubkey == node_pubkey && !*p.cancel_tx.borrow())
+    }
+
+    /// Stores a verified announce if it is newer than the one we have for that validator.
+    /// Returns true when stored (the caller then relays it).
+    pub fn store_announce(&mut self, announce: PeerAnnounce, addr: SocketAddr) -> bool {
+        match self.discovered.get_mut(&announce.node_pubkey) {
+            Some(existing) if existing.announce.timestamp >= announce.timestamp => false,
+            Some(existing) => {
+                existing.addr = addr;
+                existing.announce = announce;
+                true
+            }
+            None => {
+                self.discovered.insert(announce.node_pubkey, DiscoveredPeer {
+                    addr,
+                    announce,
+                    first_seen: std::time::Instant::now(),
+                });
+                true
+            }
+        }
+    }
+
+    /// Announces still within PEER_ANNOUNCE_MAX_AGE_SECS. A validator that stops
+    /// re-announcing (offline, left the set) stops being dialed and relayed.
+    pub fn fresh_discovered(&self) -> impl Iterator<Item = &DiscoveredPeer> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.discovered.values()
+            .filter(move |d| now.saturating_sub(d.announce.timestamp) <= PEER_ANNOUNCE_MAX_AGE_SECS)
+    }
+
+    /// Our public IP as most peers see it (None until a peer has told us).
+    pub fn best_observed_ip(&self) -> Option<IpAddr> {
+        self.observed_ips.iter().max_by_key(|(_, n)| **n).map(|(ip, _)| *ip)
+    }
+
+    /// Discovered validators we should dial now (see DISCOVERY_DIAL_GRACE_SECS).
+    pub fn discovery_dial_targets(&self, my_pubkey: &[u8; 32]) -> Vec<SocketAddr> {
+        self.fresh_discovered()
+            .filter(|d| &d.announce.node_pubkey != my_pubkey)
+            .filter(|d| !self.is_connected_to(&d.announce.node_pubkey))
+            .filter(|d| my_pubkey < &d.announce.node_pubkey
+                || d.first_seen.elapsed().as_secs() >= DISCOVERY_DIAL_GRACE_SECS)
+            .map(|d| d.addr)
+            .collect()
+    }
+
+    /// Sends a discovery payload only to peers that advertised FEATURE_PEER_DISCOVERY:
+    /// older nodes would fail to decode it and drop the connection.
+    pub async fn broadcast_discovery(&mut self, message: P2PPayload, exclude: Option<SocketAddr>) {
+        for (addr, handle) in self.peers.iter() {
+            if Some(*addr) == exclude || handle.info.features & FEATURE_PEER_DISCOVERY == 0 {
+                continue;
+            }
+            let _ = handle.tx.try_send(message.clone());
         }
     }
 
@@ -140,9 +240,10 @@ impl PeerManager {
             last_seen: now,
             connected_at: now,
             is_outbound,
+            features: 0,
         };
 
-        self.peers.insert(addr, PeerHandle { info, tx, cancel_tx, conn_id });
+        self.peers.insert(addr, PeerHandle { info, tx, prio_tx: None, cancel_tx, conn_id });
     }
 
     /// Removes a disconnected peer only if its connection ID matches (preventing stale workers from removing newer connections)
@@ -202,10 +303,31 @@ impl PeerManager {
     }
 
     /// Broadcasts a message to all connected peers (optionally excluding sender) without locking during transmission
+    /// Sends one consensus message to one peer (priority queue; dropped if it is full).
+    pub fn send_priority(&self, addr: &SocketAddr, message: P2PPayload) {
+        if let Some(h) = self.peers.get(addr) {
+            let ch = h.prio_tx.as_ref().unwrap_or(&h.tx);
+            let _ = ch.try_send(message);
+        }
+    }
+
+    /// Sets the priority (consensus) queue of a connected peer.
+    pub fn set_priority_channel(&mut self, addr: &SocketAddr, prio_tx: mpsc::Sender<P2PPayload>) {
+        if let Some(h) = self.peers.get_mut(addr) {
+            h.prio_tx = Some(prio_tx);
+        }
+    }
+
     pub async fn broadcast(&mut self, message: P2PPayload, exclude: Option<SocketAddr>) {
+        let needed = message.required_feature();
+        let priority = message.is_consensus();
         let peer_channels: Vec<(SocketAddr, mpsc::Sender<P2PPayload>, tokio::sync::watch::Sender<bool>)> = self.peers.iter()
             .filter(|(&addr, _)| Some(addr) != exclude)
-            .map(|(&addr, handle)| (addr, handle.tx.clone(), handle.cancel_tx.clone()))
+            .filter(|(_, handle)| handle.info.features & needed == needed)
+            .map(|(&addr, handle)| {
+                let ch = if priority { handle.prio_tx.as_ref().unwrap_or(&handle.tx) } else { &handle.tx };
+                (addr, ch.clone(), handle.cancel_tx.clone())
+            })
             .collect();
 
         let mut dead_peers = Vec::new();

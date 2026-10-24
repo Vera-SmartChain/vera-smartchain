@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+
 use serde_json::json;
 
 use vera_blockchain::account::{Account, address_from_hex};
@@ -19,10 +19,10 @@ async fn test_audit_eth_send_transaction_unauthorized_drain_is_blocked() {
     let attacker_addr = address_from_hex(attacker_addr_str).unwrap();
 
     let node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key)).unwrap();
-    let shared_node = Arc::new(Mutex::new(node));
+    let shared_node = Arc::new(tokio::sync::RwLock::new(node));
 
     let initial_victim_balance = {
-        let n = shared_node.lock().await;
+        let n = shared_node.write().await;
         Account::from_bytes(n.csmt.get(&victim_addr).unwrap()).unwrap().balance
     };
     assert!(initial_victim_balance > 0, "Victim must have initial balance");
@@ -50,7 +50,7 @@ async fn test_audit_eth_send_transaction_unauthorized_drain_is_blocked() {
     assert!(err_msg.contains("not supported"));
 
     // Verify victim balance is completely intact
-    let n = shared_node.lock().await;
+    let n = shared_node.write().await;
     let victim_after = Account::from_bytes(n.csmt.get(&victim_addr).unwrap()).unwrap().balance;
     let attacker_acc = n.csmt.get(&attacker_addr);
 
@@ -66,7 +66,7 @@ async fn test_audit_faucet_capped_and_rate_limited() {
     let (genesis_cfg, val_key) = GenesisConfig::default_testnet();
 
     let node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key)).unwrap();
-    let shared_node = Arc::new(Mutex::new(node));
+    let shared_node = Arc::new(tokio::sync::RwLock::new(node));
 
     let user_str = "0x8888888888888888888888888888888888888888888888888888888888888888";
     let _user_addr = address_from_hex(user_str).unwrap();
@@ -93,7 +93,7 @@ async fn test_audit_eth_send_raw_transaction_ecrecover_integrity() {
     let (genesis_cfg, val_key) = GenesisConfig::default_testnet();
 
     let node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key)).unwrap();
-    let shared_node = Arc::new(Mutex::new(node));
+    let shared_node = Arc::new(tokio::sync::RwLock::new(node));
 
     // Try submitting malformed or forged raw transaction
     let forged_raw = "0xdeadbeef1234567890";
@@ -121,7 +121,7 @@ async fn test_audit_eth_send_raw_transaction_cross_chain_replay_rejected() {
     let (genesis_cfg, val_key) = GenesisConfig::default_testnet();
 
     let node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key)).unwrap();
-    let shared_node = Arc::new(Mutex::new(node));
+    let shared_node = Arc::new(tokio::sync::RwLock::new(node));
 
     let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
     
@@ -236,7 +236,7 @@ async fn test_audit_eth_send_raw_transaction_gas_metering_and_tokenomics() {
     let (genesis_cfg, val_key) = GenesisConfig::default_testnet();
 
     let node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key)).unwrap();
-    let shared_node = Arc::new(Mutex::new(node));
+    let shared_node = Arc::new(tokio::sync::RwLock::new(node));
 
     let signing_key = SigningKey::random(&mut rand::rngs::OsRng);
     let vk = signing_key.verifying_key();
@@ -253,7 +253,7 @@ async fn test_audit_eth_send_raw_transaction_gas_metering_and_tokenomics() {
     // Pre-fund the sender account with 10 VERA
     let initial_balance = 10_000_000_000_000_000_000u128;
     {
-        let mut n = shared_node.lock().await;
+        let mut n = shared_node.write().await;
         n.csmt.insert(sender_address, Account::new(initial_balance).to_bytes());
     }
 
@@ -360,12 +360,12 @@ async fn test_audit_eth_send_raw_transaction_gas_metering_and_tokenomics() {
 
     // Propose and commit block so the transaction in mempool is executed deterministically
     {
-        let mut n = shared_node.lock().await;
+        let mut n = shared_node.write().await;
         n.propose_and_commit_block().await.expect("Block must be committed with the transaction");
     }
 
     // Verify account state and tokenomics
-    let n = shared_node.lock().await;
+    let n = shared_node.write().await;
     let sender_acc = Account::from_bytes(n.csmt.get(&sender_address).unwrap()).unwrap();
     let recip_acc = Account::from_bytes(n.csmt.get(&recipient_address).unwrap()).unwrap();
     

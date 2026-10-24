@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 pub const EMPTY_HASH: [u8; 32] = [0u8; 32];
@@ -28,7 +29,10 @@ fn get_bit(key: &[u8; 32], depth: usize) -> bool {
     ((byte >> bit_idx) & 1) == 1
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Tree node. Children are shared (`Arc`), so cloning a whole CSMT is O(1) and an insert
+/// copies only the nodes on its path (persistent / copy-on-write tree). Hashes and
+/// shape are exactly the same as with the former `Box` children.
+#[derive(Debug, Clone)]
 pub enum TreeNode {
     Empty,
     Leaf {
@@ -36,8 +40,8 @@ pub enum TreeNode {
         value_hash: [u8; 32],
     },
     Internal {
-        left: Box<TreeNode>,
-        right: Box<TreeNode>,
+        left: Arc<TreeNode>,
+        right: Arc<TreeNode>,
         hash: [u8; 32],
     },
 }
@@ -63,60 +67,36 @@ pub struct MerkleProof {
     pub non_existence_leaf: Option<([u8; 32], [u8; 32])>,
 }
 
-mod serde_values_map {
-    use std::collections::HashMap;
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(map: &HashMap<[u8; 32], Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::SerializeSeq;
-        let mut seq = serializer.serialize_seq(Some(map.len()))?;
-        for (k, v) in map {
-            let entry = (hex::encode(k), hex::encode(v));
-            seq.serialize_element(&entry)?;
-        }
-        seq.end()
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<[u8; 32], Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let list: Vec<(String, String)> = Vec::deserialize(deserializer)?;
-        let mut map = HashMap::with_capacity(list.len());
-        for (k_hex, v_hex) in list {
-            let k_bytes = hex::decode(&k_hex).map_err(serde::de::Error::custom)?;
-            let v_bytes = hex::decode(&v_hex).map_err(serde::de::Error::custom)?;
-            if k_bytes.len() != 32 {
-                return Err(serde::de::Error::custom("key must be 32 bytes"));
-            }
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&k_bytes);
-            map.insert(arr, v_bytes);
-        }
-        Ok(map)
-    }
-}
-
-/// Compact Sparse Merkle Tree (CSMT) Jellyfish-style
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Compact Sparse Merkle Tree (CSMT) Jellyfish-style.
+///
+/// Values live in a shared `base` map plus a private `delta` of changes since the last
+/// `compact`, so `clone()` is O(changes) instead of O(accounts): mempool admission and
+/// block validation simulate on clones of the whole state.
+#[derive(Debug, Clone)]
 pub struct CSMT {
     root_node: TreeNode,
-    #[serde(with = "serde_values_map")]
-    values: HashMap<[u8; 32], Vec<u8>>,
+    base: Arc<HashMap<[u8; 32], Vec<u8>>>,
+    delta: HashMap<[u8; 32], Vec<u8>>,
+    /// Keys by their last 20 bytes (EVM-style address lookup in the RPC, which used to scan
+    /// every account). Same base/delta sharing as the values. Not used by consensus.
+    suffix_base: Arc<HashMap<[u8; 20], Vec<[u8; 32]>>>,
+    suffix_delta: HashMap<[u8; 20], Vec<[u8; 32]>>,
+}
+
+fn suffix20(key: &[u8; 32]) -> [u8; 20] {
+    let mut s = [0u8; 20];
+    s.copy_from_slice(&key[12..32]);
+    s
 }
 
 impl CSMT {
-    pub fn values(&self) -> &HashMap<[u8; 32], Vec<u8>> {
-        &self.values
-    }
-
     pub fn new() -> Self {
         Self {
             root_node: TreeNode::Empty,
-            values: HashMap::new(),
+            base: Arc::new(HashMap::new()),
+            delta: HashMap::new(),
+            suffix_base: Arc::new(HashMap::new()),
+            suffix_delta: HashMap::new(),
         }
     }
 
@@ -125,16 +105,63 @@ impl CSMT {
     }
 
     pub fn get(&self, key: &[u8; 32]) -> Option<&Vec<u8>> {
-        self.values.get(key)
+        self.delta.get(key).or_else(|| self.base.get(key))
+    }
+
+    /// Number of stored keys.
+    pub fn len(&self) -> usize {
+        self.base.len() + self.delta.keys().filter(|k| !self.base.contains_key(*k)).count()
+    }
+
+    /// All (key, value) pairs; changed values override the shared base.
+    pub fn iter(&self) -> impl Iterator<Item = (&[u8; 32], &Vec<u8>)> {
+        self.delta.iter().chain(self.base.iter().filter(move |(k, _)| !self.delta.contains_key(*k)))
     }
 
     pub fn insert(&mut self, key: [u8; 32], value: Vec<u8>) {
         let val_hash = crate::chain_hash::hash256(&value);
-        self.values.insert(key, value);
-        self.root_node = Self::insert_at(self.root_node.clone(), key, val_hash, 0);
+        if self.get(&key).is_none() {
+            self.suffix_delta.entry(suffix20(&key)).or_default().push(key);
+        }
+        self.delta.insert(key, value);
+        self.root_node = Self::insert_at(&self.root_node, key, val_hash, 0);
     }
 
-    fn insert_at(node: TreeNode, key: [u8; 32], val_hash: [u8; 32], depth: usize) -> TreeNode {
+    /// Keys changed since the last `compact` (with their current values).
+    pub fn delta_entries(&self) -> Vec<([u8; 32], Vec<u8>)> {
+        let mut v: Vec<_> = self.delta.iter().map(|(k, val)| (*k, val.clone())).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// Folds `delta` into `base` when no clone shares the base any more (O(changes)).
+    /// Call after replacing the canonical state; a no-op while clones are alive.
+    pub fn compact(&mut self) {
+        if !self.delta.is_empty() {
+            if let Some(base) = Arc::get_mut(&mut self.base) {
+                base.extend(self.delta.drain());
+            }
+        }
+        if !self.suffix_delta.is_empty() {
+            if let Some(idx) = Arc::get_mut(&mut self.suffix_base) {
+                for (suffix, keys) in self.suffix_delta.drain() {
+                    idx.entry(suffix).or_default().extend(keys);
+                }
+            }
+        }
+    }
+
+    /// Keys whose last 20 bytes are `suffix`, in insertion order (RPC address lookup).
+    pub fn keys_with_suffix20(&self, suffix: &[u8; 20]) -> Vec<[u8; 32]> {
+        let mut out: Vec<[u8; 32]> = self.suffix_base.get(suffix).cloned().unwrap_or_default();
+        if let Some(more) = self.suffix_delta.get(suffix) {
+            out.extend(more.iter().copied());
+        }
+        out
+    }
+
+    /// Returns the subtree with `key` set to `val_hash`, sharing every untouched subtree.
+    fn insert_at(node: &TreeNode, key: [u8; 32], val_hash: [u8; 32], depth: usize) -> TreeNode {
         match node {
             TreeNode::Empty => TreeNode::Leaf {
                 key,
@@ -144,6 +171,7 @@ impl CSMT {
                 key: existing_key,
                 value_hash: existing_val_hash,
             } => {
+                let (existing_key, existing_val_hash) = (*existing_key, *existing_val_hash);
                 if existing_key == key {
                     // Update existing key value
                     TreeNode::Leaf {
@@ -157,7 +185,7 @@ impl CSMT {
 
                     let (left, right) = if bit_existing == bit_new {
                         let sub = Self::insert_at(
-                            TreeNode::Leaf {
+                            &TreeNode::Leaf {
                                 key: existing_key,
                                 value_hash: existing_val_hash,
                             },
@@ -196,8 +224,8 @@ impl CSMT {
 
                     let hash = hash_internal(&left.hash(), &right.hash());
                     TreeNode::Internal {
-                        left: Box::new(left),
-                        right: Box::new(right),
+                        left: Arc::new(left),
+                        right: Arc::new(right),
                         hash,
                     }
                 }
@@ -205,15 +233,15 @@ impl CSMT {
             TreeNode::Internal { left, right, .. } => {
                 let bit = get_bit(&key, depth);
                 let (new_left, new_right) = if bit {
-                    (*left, Self::insert_at(*right, key, val_hash, depth + 1))
+                    (Arc::clone(left), Arc::new(Self::insert_at(right, key, val_hash, depth + 1)))
                 } else {
-                    (Self::insert_at(*left, key, val_hash, depth + 1), *right)
+                    (Arc::new(Self::insert_at(left, key, val_hash, depth + 1)), Arc::clone(right))
                 };
 
                 let hash = hash_internal(&new_left.hash(), &new_right.hash());
                 TreeNode::Internal {
-                    left: Box::new(new_left),
-                    right: Box::new(new_right),
+                    left: new_left,
+                    right: new_right,
                     hash,
                 }
             }
@@ -313,7 +341,7 @@ impl CSMT {
 
     /// Returns all stored key/value pairs
     pub fn to_key_values(&self) -> Vec<([u8; 32], Vec<u8>)> {
-        self.values.iter().map(|(k, v)| (*k, v.clone())).collect()
+        self.iter().map(|(k, v)| (*k, v.clone())).collect()
     }
 
     /// Deterministically reconstructs CSMT from key/value pairs
@@ -322,6 +350,7 @@ impl CSMT {
         for (k, v) in entries {
             tree.insert(*k, v.clone());
         }
+        tree.compact();
         tree
     }
 }

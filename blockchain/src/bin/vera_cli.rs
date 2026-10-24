@@ -7,9 +7,65 @@ use vera_blockchain::csmt::MerkleProof;
 use vera_blockchain::genesis::GenesisConfig;
 use vera_blockchain::transaction::Transaction;
 use vera_blockchain::validator_application::{
-    is_address_in_allowlist, parse_validator_status_from_json, read_key_from_file_or_hex, ValidatorApplication,
+    is_address_in_allowlist, is_version_newer, parse_validator_status_from_json, read_key_from_file_or_hex,
+    ValidatorApplication,
 };
 use vera_engine_v2::{canonical_encode, normalize, ComputationGraph};
+
+const CURRENT_VERSION: &str = "0.2.8.1-testnet";
+
+async fn check_new_version_notice() {
+    let cache_dir = if Path::new("/var/lib/vera").is_dir() {
+        Path::new("/var/lib/vera")
+    } else {
+        Path::new("/tmp")
+    };
+    let cache_file = cache_dir.join("latest_version_cache.json");
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut latest_version: Option<String> = None;
+
+    if let Ok(content) = std::fs::read_to_string(&cache_file) {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+            let ts = val["timestamp"].as_u64().unwrap_or(0);
+            if now_ts >= ts && (now_ts - ts) < 6 * 3600 {
+                latest_version = val["latest_version"].as_str().map(|s| s.to_string());
+            }
+        }
+    }
+
+    if latest_version.is_none() {
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .user_agent("vera_cli")
+            .build()
+        {
+            if let Ok(res) = client.get("https://api.github.com/repos/Vera-SmartChain/vera-node-releases/releases/latest").send().await {
+                if let Ok(val) = res.json::<serde_json::Value>().await {
+                    if let Some(tag) = val["tag_name"].as_str() {
+                        latest_version = Some(tag.to_string());
+                        let cache_data = serde_json::json!({
+                            "timestamp": now_ts,
+                            "latest_version": tag
+                        });
+                        let _ = std::fs::write(&cache_file, cache_data.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(latest) = latest_version {
+        if is_version_newer(&latest, CURRENT_VERSION) {
+            println!("\n💡 New version {} available — run: sudo bash vera-join.sh --upgrade", latest);
+        }
+    }
+}
+
 
 fn parse_key_and_remaining_args(
     args: &[String],
@@ -94,6 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print_usage();
         return Ok(());
     }
+
+    if args.iter().any(|a| a == "--version" || a == "-V" || a == "version") {
+        println!("vera_cli {}", CURRENT_VERSION);
+        return Ok(());
+    }
+
 
     let rpc_url = env::var("VERA_RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".to_string());
 
@@ -232,7 +294,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => eprintln!("Error connecting to RPC node ({}): {}", rpc_url, e),
             }
+            check_new_version_notice().await;
         }
+
         "balance" => {
             if args.len() < 3 {
                 eprintln!("Usage: vera_cli balance <hex_address>");
@@ -336,19 +400,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             handle_rpc_tx_response(&json_res, "🚀 Transaction Broadcast!")?;
         }
         "stake" => {
-            if args.len() < 3 {
-                eprintln!("Usage: vera_cli stake [--key-file <path> | <priv_hex>] <amount_wei> [nonce]");
+            let mut force = false;
+            let mut filtered_args = Vec::new();
+            for a in &args[2..] {
+                if a == "--force" {
+                    force = true;
+                } else {
+                    filtered_args.push(a.clone());
+                }
+            }
+
+            if filtered_args.is_empty() {
+                eprintln!("Usage: vera_cli stake [--key-file <path> | <priv_hex>] [--force] <amount_wei> [nonce]");
                 return Ok(());
             }
-            let (signing_key, rem) = parse_key_and_remaining_args(&args[2..])?;
+            let (signing_key, rem) = parse_key_and_remaining_args(&filtered_args)?;
             if rem.is_empty() {
-                eprintln!("Usage: vera_cli stake [--key-file <path> | <priv_hex>] <amount_wei> [nonce]");
+                eprintln!("Usage: vera_cli stake [--key-file <path> | <priv_hex>] [--force] <amount_wei> [nonce]");
                 return Ok(());
             }
             let amount: u128 = rem[0].parse()?;
             let user_nonce: Option<u64> = if rem.len() > 1 { Some(rem[1].parse()?) } else { None };
 
             let client = reqwest::Client::new();
+
+            if !force {
+                let pub_bytes = signing_key.verifying_key().to_bytes();
+                let caller_addr = address_to_hex(&address_from_pubkey(&pub_bytes));
+
+                let val_payload = json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "vera_getValidators",
+                    "params": []
+                });
+
+                let val_res = client.post(&rpc_url).json(&val_payload).send().await
+                    .map_err(|e| format!("Failed to connect to RPC node ({}): {}", rpc_url, e))?;
+                let val_json: serde_json::Value = val_res.json().await?;
+
+                if !is_address_in_allowlist(&val_json, &caller_addr) {
+                    eprintln!("Error: not in validator allowlist — apply first (Step 5)");
+                    std::process::exit(1);
+                }
+            }
+
             let nonce = resolve_nonce(&client, &rpc_url, &signing_key, user_nonce).await?;
 
             let tx = Transaction::new(
@@ -374,6 +470,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let json_res: serde_json::Value = res.json().await?;
             handle_rpc_tx_response(&json_res, "🔒 Staking Transaction Broadcast!")?;
         }
+
         "unstake" => {
             if args.len() < 3 {
                 eprintln!("Usage: vera_cli unstake [--key-file <path> | <priv_hex>] <amount_wei> [nonce]");
@@ -647,6 +744,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "params": []
             });
 
+            let mut last_log = std::time::Instant::now() - std::time::Duration::from_secs(10);
+
             loop {
                 if start.elapsed().as_secs() > timeout_secs {
                     eprintln!("Error: Timeout waiting for synchronization after {}s", timeout_secs);
@@ -673,9 +772,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                if last_log.elapsed().as_secs() >= 5 {
+                    last_log = std::time::Instant::now();
+                    match (local_h, remote_h) {
+                        (Some(lh), Some(rh)) => {
+                            println!("Sync progress: local #{} / network #{}", lh, rh);
+                        }
+                        (None, Some(rh)) => {
+                            eprintln!("local RPC unreachable at {} — is vera-node running? (network is at #{})", local_url, rh);
+                        }
+                        (Some(lh), None) => {
+                            eprintln!("network RPC unreachable at {} — check internet connectivity (local is at #{})", remote_url, lh);
+                        }
+
+                        (None, None) => {
+                            eprintln!("local RPC unreachable at {} AND network RPC unreachable at {}", local_url, remote_url);
+                        }
+                    }
+                }
+
                 tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             }
         }
+
         "apply-validator" => {
             let mut key_file: Option<String> = None;
             let mut operator: Option<String> = None;
@@ -775,7 +894,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Active Peers:  {}", peer_count);
             println!();
             println!("{} stake={} VERA jailed={}", status.state, stake_vera, status.is_jailed);
+            check_new_version_notice().await;
         }
+
         "approve-validator" => {
             let mut block_text: Option<String> = None;
             let mut gov_key_path = "/etc/vera/governance_key.hex".to_string();
@@ -1035,8 +1156,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_usage() {
-    println!("VERA SmartChain Node CLI v1.0.0");
-    println!("Usage:");
+    println!("VERA SmartChain Node CLI (v0.2.8.1-testnet)");
+    println!("Usage: vera_cli <command> [options]");
+    println!();
+    println!("Commands:");
+    println!("  vera_cli --version");
     println!("  vera_cli keygen [--out <path>]");
     println!("  vera_cli status");
     println!("  vera_cli syncwait [--timeout <seconds>] [--remote <url>] [--local <url>]");
@@ -1046,7 +1170,7 @@ fn print_usage() {
     println!("  vera_cli balance <address>");
     println!("  vera_cli verify <address>");
     println!("  vera_cli transfer [--key-file <path> | <priv_hex>] <recipient_hex> <amount> [nonce]");
-    println!("  vera_cli stake [--key-file <path> | <priv_hex>] <amount_wei> [nonce]");
+    println!("  vera_cli stake [--key-file <path> | <priv_hex>] [--force] <amount_wei> [nonce]");
     println!("  vera_cli unstake [--key-file <path> | <priv_hex>] <amount_wei> [nonce]");
     println!("  vera_cli unjail [--key-file <path> | <priv_hex>] [nonce]");
     println!("  vera_cli allow [--key-file <path> | <gov_priv_hex>] <val_addr_hex> [nonce]");
@@ -1058,6 +1182,7 @@ fn print_usage() {
     println!("  vera_cli disassemble <binary.vbc>");
     println!("  vera_cli genesis [dest.json]");
 }
+
 
 fn handle_rpc_tx_response(json_res: &serde_json::Value, success_msg: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(err) = json_res.get("error") {

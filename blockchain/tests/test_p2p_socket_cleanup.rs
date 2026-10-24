@@ -264,8 +264,18 @@ async fn test_peer_reconnect_deduplicates_to_single_connection() {
 
     // Verify old socket1 was cancelled and closed by server
     // Trying to read from old socket1 should return EOF or error
-    let read_res = tokio::time::timeout(Duration::from_secs(3), recv_p2p_message(&mut socket1)).await;
-    assert!(read_res.is_err() || read_res.unwrap().is_err(), "Old socket must be closed/terminated by server");
+    // (v0.2.5: the server may first deliver the AddrHint it queued right after the
+    // handshake — skip discovery messages, the socket must still end up closed.)
+    let closed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match recv_p2p_message(&mut socket1).await {
+                Ok(P2PPayload::AddrHint { .. }) | Ok(P2PPayload::PeerAnnounce(_)) => continue,
+                Ok(_) => return false,
+                Err(_) => return true,
+            }
+        }
+    }).await;
+    assert!(closed.is_err() || closed.unwrap(), "Old socket must be closed/terminated by server");
 
     // 3. Clean up socket2
     drop(socket2);

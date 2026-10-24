@@ -26,6 +26,14 @@ pub enum P2PEvent {
     SyncRequest { peer_addr: SocketAddr, req: SyncRequest },
     SyncResponse { peer_addr: SocketAddr, res: SyncResponse },
     PeerConnected { addr: SocketAddr, height: u64 },
+    /// Signature/freshness-checked by the receiver; validator-set membership is checked
+    /// by the node event loop before the announce is stored, relayed or dialed.
+    PeerAnnounce { peer_addr: SocketAddr, announce: PeerAnnounce },
+    TmProposal { peer_addr: SocketAddr, proposal: TmProposal },
+    TmVote { peer_addr: SocketAddr, vote: crate::consensus::Vote },
+    TmCompactProposal { peer_addr: SocketAddr, compact: TmCompactProposal },
+    TmProposalRequest { peer_addr: SocketAddr, height: u64, round: u64, missing: String },
+    TmProposalTxs { peer_addr: SocketAddr, height: u64, round: u64, txs: Vec<crate::transaction::Transaction> },
     PeerDisconnected { addr: SocketAddr },
 }
 
@@ -112,11 +120,18 @@ pub fn should_log(attempts: u32, last_type: Option<SeedFailureType>, current_typ
     }
 }
 
+/// Per-connection queue for consensus messages (ahead of transaction gossip).
+const PRIORITY_QUEUE_LEN: usize = 1024;
+
 pub struct P2PService {
     pub chain_id: String,
     pub peer_manager: SharedPeerManager,
     pub signing_key: Arc<SigningKey>,
     pub event_tx: mpsc::Sender<P2PEvent>,
+    /// When set, gossiped transactions go here instead of `event_tx` (try_send: a flood
+    /// of transactions never blocks the connection reader, so the consensus messages
+    /// behind them on the same socket are not delayed).
+    pub tx_event_tx: Option<mpsc::Sender<crate::transaction::Transaction>>,
     pub local_height: Arc<AtomicU64>,
     pub seed_trackers: Arc<Mutex<std::collections::HashMap<SocketAddr, SeedConnTracker>>>,
 }
@@ -141,6 +156,7 @@ impl P2PService {
             peer_manager: Arc::clone(&peer_manager),
             signing_key: key_arc,
             event_tx,
+            tx_event_tx: None,
             local_height,
             seed_trackers: Arc::new(Mutex::new(std::collections::HashMap::new())),
         };
@@ -156,6 +172,7 @@ impl P2PService {
             .map_err(|e| format!("Failed to get local address of P2P listener: {}", e))?;
 
         println!("🌐 [P2P Wire] Listener listening for peer-to-peer connections on {}", local_addr);
+        self.peer_manager.lock().await.listen_port = local_addr.port();
 
         // 1. Inbound connection loop
         let svc_inbound = Arc::clone(&self);
@@ -181,9 +198,16 @@ impl P2PService {
         // 2. Outbound seed connection loop
         let svc_outbound = Arc::clone(&self);
         tokio::spawn(async move {
+            // Seeds every 30 s (unchanged); discovered validators every 10 s so a new
+            // validator joins the mesh quickly.
+            let mut tick: u64 = 0;
             loop {
-                svc_outbound.maintain_seed_connections().await;
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if tick % 3 == 0 {
+                    svc_outbound.maintain_seed_connections().await;
+                }
+                svc_outbound.maintain_discovered_connections().await;
+                tick = tick.wrapping_add(1);
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
         });
 
@@ -229,9 +253,14 @@ impl P2PService {
         let my_ack = HandshakeMsg::new(&self.chain_id, local_height, &self.signing_key);
         send_p2p_message(&mut socket, &P2PPayload::HandshakeAck(my_ack)).await
             .map_err(|e| format!("Failed to send HandshakeAck to {}: {}", remote_addr, e))?;
+        // Self-connection: refuse only AFTER the ack, so the dialing side (also us) sees
+        // its own key in the ack and stops dialing that address.
+        if remote_handshake.node_pubkey == self.signing_key.verifying_key().to_bytes() {
+            return Err(format!("Refusing self-connection from {} (our own node key)", remote_addr));
+        }
 
         // 4. Connection established: create channels and register in PeerManager
-        self.spawn_peer_worker(socket, remote_addr, remote_handshake.node_pubkey, remote_handshake.height, false).await
+        self.spawn_peer_worker(socket, remote_addr, remote_handshake.node_pubkey, remote_handshake.height, false, remote_handshake.features).await
     }
 
     /// Establishes outbound connection to a seed node
@@ -242,6 +271,9 @@ impl P2PService {
             let mut pm = self.peer_manager.lock().await;
             if pm.peers.values().any(|p| p.info.addr == seed_addr && !*p.cancel_tx.borrow()) {
                 return Ok(false); // Already connected and active
+            }
+            if pm.self_addrs.contains(&seed_addr) {
+                return Ok(false); // this address is ourselves
             }
             if let Err(e) = pm.check_admission(&seed_addr) {
                 return Err(SeedFailure::new(SeedFailureType::Admission, format!("Local admission rejected: {}", e)));
@@ -339,9 +371,16 @@ impl P2PService {
                 format!("HandshakeAck verification rejected: {}", e),
             ))?;
 
+        if remote_ack.node_pubkey == self.signing_key.verifying_key().to_bytes() {
+            // Our own IP is in the seed list: remember it and stop dialing it.
+            println!("ℹ️ [P2P Wire] Seed {} is this node itself; it will not be dialed again", seed_addr);
+            self.peer_manager.lock().await.self_addrs.insert(seed_addr);
+            return Ok(false);
+        }
+
         println!("✅ [P2P Wire] Authenticated connection established with seed {}", seed_addr);
 
-        self.spawn_peer_worker(socket, seed_addr, remote_ack.node_pubkey, remote_ack.height, true).await
+        self.spawn_peer_worker(socket, seed_addr, remote_ack.node_pubkey, remote_ack.height, true, remote_ack.features).await
             .map_err(|e| SeedFailure::new(SeedFailureType::Admission, format!("Failed to spawn peer worker: {}", e)))?;
         Ok(true)
     }
@@ -354,9 +393,11 @@ impl P2PService {
         node_pubkey: [u8; 32],
         height: u64,
         is_outbound: bool,
+        features: u32,
     ) -> Result<(), String> {
         let (mut reader, mut writer) = socket.into_split();
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<P2PPayload>(128);
+        let (prio_tx, mut prio_rx) = mpsc::channel::<P2PPayload>(PRIORITY_QUEUE_LEN);
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -369,6 +410,15 @@ impl P2PService {
         {
             let mut pm = self.peer_manager.lock().await;
             pm.add_peer(remote_addr, node_pubkey, height, is_outbound, outgoing_tx.clone(), cancel_tx.clone(), conn_id);
+            pm.set_features(&remote_addr, features);
+            pm.set_priority_channel(&remote_addr, prio_tx);
+            if features & FEATURE_PEER_DISCOVERY != 0 {
+                // Tell the peer which IP we see it on, and hand it every validator we know.
+                let _ = outgoing_tx.try_send(P2PPayload::AddrHint { ip: remote_addr.ip().to_string() });
+                for d in pm.fresh_discovered() {
+                    let _ = outgoing_tx.try_send(P2PPayload::PeerAnnounce(d.announce.clone()));
+                }
+            }
         }
 
         let _ = self.event_tx.send(P2PEvent::PeerConnected { addr: remote_addr, height }).await;
@@ -408,12 +458,33 @@ impl P2PService {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    biased;
                     _ = cancel_rx_write.changed() => {
                         break;
                     }
+                    // Consensus first; the channel never closes while this task runs
+                    // (the PeerManager holds its sender), so None is not reachable here.
+                    Some(msg) = prio_rx.recv() => {
+                        let msg = match msg.adapt_for(features) {
+                            Some(m) => m,
+                            None => continue,
+                        };
+                        if let Ok(mut guard) = last_sent_write.lock() {
+                            *guard = Some(msg.type_name());
+                        }
+                        if let Err(e) = send_p2p_message(&mut writer, &msg).await {
+                            if !disconnect_logged_write.swap(true, Ordering::Relaxed) {
+                                eprintln!("🔌 [P2P Wire] Peer {} write error after {:.2}s: {}",
+                                    remote_addr, connected_at_write.elapsed().as_secs_f64(), e);
+                            }
+                            let _ = cancel_tx_write.send(true);
+                            break;
+                        }
+                    }
                     msg = outgoing_rx.recv() => {
-                        match msg {
-                            Some(msg) => {
+                        match msg.map(|m| m.adapt_for(features)) {
+                            Some(None) => continue,
+                            Some(Some(msg)) => {
                                 if let Ok(mut guard) = last_sent_write.lock() {
                                     *guard = Some(msg.type_name());
                                 }
@@ -451,15 +522,19 @@ impl P2PService {
         let mut cancel_rx_read = cancel_rx.clone();
         let pm_ref_read = Arc::clone(&self.peer_manager);
         let event_tx_clone = self.event_tx.clone();
+        let tx_event_tx = self.tx_event_tx.clone();
         let local_height_clone = Arc::clone(&self.local_height);
         let pong_tx = outgoing_tx.clone();
         let last_sent_read = Arc::clone(&last_sent);
         let last_received_read = Arc::clone(&last_received);
         let connected_at_read = connected_at;
         let disconnect_logged_read = Arc::clone(&disconnect_logged);
+        let chain_id_read = self.chain_id.clone();
 
         // Task 2: Read messages from TCP socket with timeout, cancellation, and zero lock-holding during await
         tokio::spawn(async move {
+            // One AddrHint per connection: a single peer must not be able to outvote others.
+            let mut addr_hint_taken = false;
             loop {
                 tokio::select! {
                     _ = cancel_rx_read.changed() => {
@@ -494,10 +569,20 @@ impl P2PService {
                                         }
                                         P2PPayload::NewTransaction(tx) => {
                                             let hash = tx.tx_hash();
-                                            if pm.mark_seen(hash) {
-                                                (Some(P2PEvent::NewTransaction(tx)), None)
-                                            } else {
+                                            if pm.seen_hashes.contains(&hash) {
                                                 (None, None)
+                                            } else if let Some(ch) = &tx_event_tx {
+                                                // Full = the node is behind on admissions: drop
+                                                // this copy instead of stalling the socket. It is
+                                                // not marked seen, so a later re-gossip gets in.
+                                                if ch.try_send(tx).is_ok() {
+                                                    pm.mark_seen(hash);
+                                                }
+                                                (None, None)
+                                            } else if !pm.mark_seen(hash) {
+                                                (None, None)
+                                            } else {
+                                                (Some(P2PEvent::NewTransaction(tx)), None)
                                             }
                                         }
                                         P2PPayload::BlockProposal(block) => {
@@ -527,6 +612,71 @@ impl P2PService {
                                         }
                                         P2PPayload::SyncResponse(res) => {
                                             (Some(P2PEvent::SyncResponse { peer_addr: remote_addr, res }), None)
+                                        }
+                                        // Tendermint messages: dedupe by signature here; the node
+                                        // verifies them and relays the ones it accepts.
+                                        P2PPayload::TmProposal(proposal) => {
+                                            let mut sig_id = [0u8; 32];
+                                            sig_id.copy_from_slice(&proposal.signature[..32]);
+                                            if pm.mark_seen(sig_id) {
+                                                (Some(P2PEvent::TmProposal { peer_addr: remote_addr, proposal }), None)
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
+                                        P2PPayload::TmVote(vote) => {
+                                            let mut sig_id = [0u8; 32];
+                                            sig_id.copy_from_slice(&vote.signature[..32]);
+                                            if pm.mark_seen(sig_id) {
+                                                (Some(P2PEvent::TmVote { peer_addr: remote_addr, vote }), None)
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
+                                        P2PPayload::TmCompactProposal(compact) => {
+                                            let mut sig_id = [0u8; 32];
+                                            sig_id.copy_from_slice(&compact.proposal.signature[..32]);
+                                            if pm.mark_seen(sig_id) {
+                                                (Some(P2PEvent::TmCompactProposal { peer_addr: remote_addr, compact }), None)
+                                            } else {
+                                                (None, None)
+                                            }
+                                        }
+                                        P2PPayload::TmProposalRequest { height, round, missing } => {
+                                            (Some(P2PEvent::TmProposalRequest { peer_addr: remote_addr, height, round, missing }), None)
+                                        }
+                                        P2PPayload::TmProposalTxs { height, round, txs } => {
+                                            (Some(P2PEvent::TmProposalTxs { peer_addr: remote_addr, height, round, txs }), None)
+                                        }
+                                        // Requested by us: delivered even though the compact form
+                                        // of the same proposal was already seen.
+                                        P2PPayload::TmProposalFull(proposal) => {
+                                            (Some(P2PEvent::TmProposal { peer_addr: remote_addr, proposal }), None)
+                                        }
+                                        P2PPayload::AddrHint { ip } => {
+                                            if !addr_hint_taken {
+                                                addr_hint_taken = true;
+                                                if let Ok(ip) = ip.parse::<std::net::IpAddr>() {
+                                                    if pm.observed_ips.len() < 16 || pm.observed_ips.contains_key(&ip) {
+                                                        *pm.observed_ips.entry(ip).or_insert(0) += 1;
+                                                    }
+                                                }
+                                            }
+                                            (None, None)
+                                        }
+                                        P2PPayload::PeerAnnounce(announce) => {
+                                            // Cheap checks here; the node checks validator-set membership.
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0);
+                                            let mut sig_id = [0u8; 32];
+                                            sig_id.copy_from_slice(&announce.signature[..32]);
+                                            if announce.verify(&chain_id_read, now).is_ok() && pm.mark_seen(sig_id) {
+                                                (Some(P2PEvent::PeerAnnounce { peer_addr: remote_addr, announce }), None)
+                                            } else {
+                                                (None, None)
+                                            }
                                         }
                                         _ => (None, None),
                                     }
@@ -570,6 +720,32 @@ impl P2PService {
         });
 
         Ok(())
+    }
+
+    /// Dials validators learned through PeerAnnounce that we are not connected to yet.
+    pub async fn maintain_discovered_connections(&self) {
+        let my_pubkey = self.signing_key.verifying_key().to_bytes();
+        let targets = self.peer_manager.lock().await.discovery_dial_targets(&my_pubkey);
+        for addr in targets {
+            match self.connect_to_seed(addr).await {
+                Ok(true) => println!("🧭 [P2P Discovery] Connected to discovered validator at {}", addr),
+                Ok(false) => {}
+                Err(e) => {
+                    let mut trackers = self.seed_trackers.lock().await;
+                    let tracker = trackers.entry(addr).or_insert_with(|| SeedConnTracker {
+                        attempts: 0,
+                        first_failed_at: std::time::Instant::now(),
+                        last_failure_type: None,
+                        last_reason: String::new(),
+                    });
+                    tracker.attempts += 1;
+                    if should_log(tracker.attempts, tracker.last_failure_type, e.kind) {
+                        eprintln!("⚠️ [P2P Discovery] Dial to discovered validator {} failed: {} (attempt {})", addr, e.message, tracker.attempts);
+                        tracker.last_failure_type = Some(e.kind);
+                    }
+                }
+            }
+        }
     }
 
     /// Attempts to maintain active connections with known seed nodes

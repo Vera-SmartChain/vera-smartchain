@@ -43,6 +43,20 @@ pub struct GenesisConfig {
     pub governance_address: Option<String>,
     #[serde(default)]
     pub validator_allowlist: Vec<String>,
+    /// First height decided by the Tendermint engine (devnets). Public networks take it
+    /// from `builtin_tendermint_activation` instead, so their genesis file never changes.
+    #[serde(default)]
+    pub tendermint_activation_height: Option<u64>,
+}
+
+/// Tendermint activation height of public networks, fixed per release (a coordinated,
+/// consensus-breaking upgrade). None = not scheduled yet.
+pub fn builtin_tendermint_activation(chain_id: &str) -> Option<u64> {
+    match chain_id {
+        // v0.2.6 (21/Out/2026): announced at #102, every validator upgrades before #152.
+        "vera-testnet-1" => Some(152),
+        _ => None,
+    }
 }
 
 fn default_evm_chain_id() -> u64 {
@@ -232,6 +246,7 @@ impl GenesisConfig {
             permissioned_validators: true,
             governance_address: Some(address_to_hex(&user_addr)),
             validator_allowlist: vec![address_to_hex(&val_addr)],
+            tendermint_activation_height: None,
         };
 
         (cfg, val_signing_key)
@@ -296,6 +311,7 @@ impl GenesisConfig {
             permissioned_validators: false,
             governance_address: Some("000000000000000000000000000000000000000000000000000000000000ec05".to_string()),
             validator_allowlist: vec![],
+            tendermint_activation_height: None,
         })
     }
 }

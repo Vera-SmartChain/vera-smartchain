@@ -16,6 +16,9 @@ pub mod p2p;
 pub mod rpc;
 pub mod state_transition;
 pub mod storage;
+pub mod tendermint;
+pub mod tm_driver;
+pub mod hw;
 pub mod transaction;
 
 pub use ed25519_dalek;

@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+
 
 use crate::account::{Account, Address};
 use crate::block::{Block, BlockHeader, ValidatorCommit};
@@ -25,6 +25,28 @@ pub struct TxRecord {
     pub status: String,
 }
 
+/// Length of the explorer's latest-transactions list.
+pub const MAX_RECENT_TXS: usize = 100;
+
+fn tx_record(tx: &Transaction, height: u64, timestamp: u64) -> TxRecord {
+    TxRecord {
+        hash: format!("0x{}", hex::encode(tx.tx_hash())),
+        block_number: height,
+        from: format!("0x{}", hex::encode(&tx.sender[12..32])),
+        to: tx.to.as_ref().map(|t| format!("0x{}", hex::encode(&t[12..32]))),
+        value: format!("0x{:x}", tx.amount),
+        tx_type: if tx.to.is_none() {
+            "CONTRACT_CREATION".to_string()
+        } else if !tx.program.is_empty() {
+            "CONTRACT_CALL".to_string()
+        } else {
+            "TRANSFER".to_string()
+        },
+        timestamp,
+        status: "SUCCESS".to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityIncident {
     pub id: String,
@@ -40,6 +62,61 @@ pub struct SecurityIncident {
     pub mitigation_notes: String,
 }
 
+/// A block executed on top of the state whose latest block is `base_hash` (by
+/// `build_proposal` or `validate_proposal`). `apply_block` reuses it for that same block on
+/// that same state instead of executing every transaction again, so a block is executed
+/// once per node instead of two (followers) or three (proposer) times.
+#[derive(Clone)]
+/// Inputs of a proposal build (see `FullNode::build_inputs`).
+pub struct BuildInputs {
+    pub key: SigningKey,
+    pub chain_id: String,
+    pub evm_chain_id: u64,
+    pub next_height: u64,
+    pub prev_hash: [u8; 32],
+    pub address: Address,
+    pub last_committed_signatures: Vec<crate::block::ValidatorCommit>,
+    pub last_commit_round: u64,
+    pub mempool: Vec<Transaction>,
+    pub csmt: CSMT,
+}
+
+/// Result of `FullNode::build_block`, applied to the node by `finish_build`.
+pub struct BuiltBlock {
+    pub block: Block,
+    pub exec: ExecutedBlock,
+    pub dropped_from_mempool: Vec<[u8; 32]>,
+    pub rejected_txs: bool,
+}
+
+/// Inputs of a full mempool prune computed off the node lock (see `full_prune_snapshot`).
+pub struct FullPruneSnapshot {
+    pub csmt: CSMT,
+    pub mempool: Vec<Transaction>,
+    pub proposer: Address,
+    pub next_height: u64,
+    pub evm_chain_id: u64,
+}
+
+/// Txs a full prune would drop: (tx hash, sender, sender account bytes in the snapshot).
+pub struct FullPruneResult {
+    pub drop: Vec<([u8; 32], Address, Option<Vec<u8>>)>,
+}
+
+/// State to execute a proposal on (see `FullNode::exec_snapshot`).
+pub struct ExecSnapshot {
+    pub csmt: CSMT,
+    pub evm_chain_id: u64,
+    pub base_hash: [u8; 32],
+}
+
+pub struct ExecutedBlock {
+    pub base_hash: [u8; 32],
+    pub block_hash: [u8; 32],
+    pub csmt: CSMT,
+    pub roots: ([u8; 32], [u8; 32], [u8; 32]),
+}
+
 pub struct FullNode {
     pub chain_id: String,
     pub evm_chain_id: u64,
@@ -52,6 +129,27 @@ pub struct FullNode {
     pub height: u64,
     pub latest_block_hash: [u8; 32],
     pub last_committed_signatures: Vec<crate::block::ValidatorCommit>,
+    /// Round of `last_committed_signatures` (the latest block's commit certificate).
+    pub last_commit_round: u64,
+    /// First height decided by the Tendermint engine (None = legacy consensus only).
+    pub tendermint_activation: Option<u64>,
+    /// Mempool changed since the last save (admission no longer rewrites it every time).
+    pub mempool_dirty: bool,
+    /// Last full prune (re-execution of the pending txs); see `full_prune_due`.
+    pub last_full_prune: Option<std::time::Instant>,
+    /// A build saw candidates its execution rejected: run a full prune soon.
+    pub full_prune_requested: bool,
+    /// Admission-only cache: sender -> (height, next nonce, sender account bytes after all
+    /// its pending txs). Lets admitting nonce n+1 execute only the new tx instead of
+    /// re-executing the sender's whole pending chain. Cleared whenever the state or the
+    /// mempool loses txs. Never used by consensus (blocks always re-execute everything).
+    pub admission_cache: std::collections::HashMap<Address, (u64, u64, Vec<u8>)>,
+    /// Serialized size of the mempool (None = recompute). Kept up to date on admission
+    /// and invalidated wherever txs leave the mempool, so admission no longer
+    /// re-serializes every pending tx to check MAX_MEMPOOL_BYTES.
+    pub mempool_bytes: Option<usize>,
+    /// Last executed block (see `ExecutedBlock`). Mutex because `validate_proposal` takes &self.
+    pub exec_cache: std::sync::Mutex<Option<ExecutedBlock>>,
     pub recent_transactions: Vec<TxRecord>,
     pub tx_index: std::collections::HashMap<[u8; 32], (u64, usize)>,
     pub binary_hash: [u8; 32],
@@ -62,12 +160,51 @@ pub struct FullNode {
     pub peer_count: usize,
 }
 
-pub type SharedNode = Arc<Mutex<FullNode>>;
+/// Shared node state. RwLock: RPC reads and P2P/consensus reads proceed in parallel;
+/// writers (block application, admission) get priority (tokio RwLock is write-preferring).
+pub type SharedNode = Arc<tokio::sync::RwLock<FullNode>>;
 
-pub const MAX_MEMPOOL_SIZE: usize = 5_000;
+pub const MAX_MEMPOOL_SIZE: usize = 20_000;
+pub const MAX_MEMPOOL_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+pub const MAX_RAW_EVM_BYTES: usize = 128 * 1024; // 128 KiB (matching geth)
+pub const MAX_PROGRAM_BYTES: usize = 128 * 1024; // 128 KiB
+pub const MAX_TX_SERIALIZED_BYTES: usize = 512 * 1024; // 512 KiB
+/// Blocks with at least this many transactions log where apply_block spent its time.
+pub const TIMING_LOG_MIN_TXS: usize = 200;
+
+/// Wall-clock time per named stage, for the timing log lines. Only measures.
+pub struct StageTimer {
+    last: std::time::Instant,
+    stages: Vec<(&'static str, f64)>,
+}
+
+impl StageTimer {
+    pub fn new() -> Self {
+        Self { last: std::time::Instant::now(), stages: Vec::new() }
+    }
+    pub fn mark(&mut self, name: &'static str) {
+        let now = std::time::Instant::now();
+        self.stages.push((name, (now - self.last).as_secs_f64() * 1000.0));
+        self.last = now;
+    }
+    pub fn summary(&self) -> String {
+        self.stages.iter().map(|(n, ms)| format!("{} {:.1}", n, ms)).collect::<Vec<_>>().join(" | ")
+    }
+}
+
+pub const MAX_BLOCK_TX_BYTES: usize = 2_621_440; // 2.5 MiB (cheap pre-filter)
+pub const MAX_BLOCK_WIRE_BYTES: usize = 3_407_872; // 3.25 MiB (complete BlockProposal frame envelope limit)
+pub const MAX_TX_LOGS_BYTES: usize = 256 * 1024; // 256 KiB maximum logs per transaction
 
 pub const MAX_PENDING_NONCE_GAP: u64 = 16;
+/// Longest interval between full mempool prunes while blocks keep coming.
+pub const FULL_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 pub const MAX_FUTURE_BLOCK_TIME_SECS: u64 = 15;
+/// Full state snapshot cadence; between snapshots only per-block deltas are written.
+pub const STATE_SNAPSHOT_EVERY: u64 = 100;
+pub const MAX_DELTA_LOG_BYTES: u64 = 256 * 1024 * 1024;
+/// Highest commit round accepted in a block (bounds the proposer check loop).
+pub const MAX_TENDERMINT_COMMIT_ROUND: u64 = 10_000;
 
 
 pub fn format_utc_timestamp(ts: u64) -> String {
@@ -183,6 +320,8 @@ impl FullNode {
                 (genesis_csmt, 0, genesis_block.hash())
             }
         };
+        let mut csmt = csmt;
+        csmt.compact(); // move the initial state into the shared base (cheap clones)
 
         if let Some(bytes) = csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
             if let Ok(vset) = ValidatorSet::from_bytes(bytes) {
@@ -203,37 +342,48 @@ impl FullNode {
             Vec::new()
         };
 
-        let mut recent_transactions = Vec::new();
-        let mut tx_index = std::collections::HashMap::new();
-        for h in 1..=height {
-            if let Ok(Some(b)) = storage.load_block(h) {
-                for (idx, tx) in b.transactions.iter().enumerate() {
-                    tx_index.insert(tx.tx_hash(), (h, idx));
-                    recent_transactions.insert(0, TxRecord {
-                        hash: format!("0x{}", hex::encode(tx.tx_hash())),
-                        block_number: h,
-                        from: format!("0x{}", hex::encode(&tx.sender[12..32])),
-                        to: tx.to.as_ref().map(|t| format!("0x{}", hex::encode(&t[12..32]))),
-                        value: format!("0x{:x}", tx.amount),
-                        tx_type: if tx.to.is_none() {
-                            "CONTRACT_CREATION".to_string()
-                        } else if !tx.program.is_empty() {
-                            "CONTRACT_CALL".to_string()
-                        } else {
-                            "TRANSFER".to_string()
-                        },
-                        timestamp: b.header.timestamp,
-                        status: "SUCCESS".to_string(),
-                    });
+        // Tx-hash index: persisted, so only heights the file does not cover are read from
+        // the blocks (all of them once, when upgrading from a version without the file).
+        let (mut tx_index, covered) = storage.load_tx_index(height);
+        if covered < height {
+            let t = std::time::Instant::now();
+            for h in (covered + 1)..=height {
+                if let Ok(Some(b)) = storage.load_block(h) {
+                    let hashes: Vec<[u8; 32]> = b.transactions.iter().map(|tx| tx.tx_hash()).collect();
+                    for (idx, hash) in hashes.iter().enumerate() {
+                        tx_index.insert(*hash, (h, idx));
+                    }
+                    let _ = storage.append_tx_index(h, &hashes);
                 }
             }
+            if height - covered > 1 {
+                println!("🗂️  Tx index rebuilt for heights {}..={} ({:.1} s)", covered + 1, height, t.elapsed().as_secs_f64());
+            }
+        }
+        // Latest txs for the explorer: newest blocks first, read until MAX_RECENT_TXS.
+        let mut recent_transactions = Vec::new();
+        let mut h = height;
+        while h >= 1 && recent_transactions.len() < MAX_RECENT_TXS {
+            if let Ok(Some(b)) = storage.load_block(h) {
+                for tx in b.transactions.iter().rev() {
+                    if recent_transactions.len() >= MAX_RECENT_TXS {
+                        break;
+                    }
+                    recent_transactions.push(tx_record(tx, h, b.header.timestamp));
+                }
+            }
+            h -= 1;
         }
 
-        let last_committed_signatures = if height > 0 {
-            storage.load_block(height).ok().flatten().map(|b| b.validator_signatures).unwrap_or_default()
+        let (last_committed_signatures, last_commit_round) = if height > 0 {
+            storage.load_block(height).ok().flatten()
+                .map(|b| (b.validator_signatures, b.commit_round))
+                .unwrap_or_default()
         } else {
-            Vec::new()
+            (Vec::new(), 0)
         };
+        let tendermint_activation = genesis.tendermint_activation_height
+            .or_else(|| crate::genesis::builtin_tendermint_activation(&genesis.chain_id));
 
         let mut node = Self {
             chain_id,
@@ -247,6 +397,14 @@ impl FullNode {
             height,
             latest_block_hash,
             last_committed_signatures,
+            last_commit_round,
+            tendermint_activation,
+            mempool_dirty: false,
+            last_full_prune: None,
+            full_prune_requested: false,
+            admission_cache: std::collections::HashMap::new(),
+            mempool_bytes: None,
+            exec_cache: std::sync::Mutex::new(None),
             recent_transactions,
             tx_index,
             binary_hash,
@@ -284,6 +442,31 @@ impl FullNode {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // 0. Payload size bounds (Anti-DoS / Memory Exhaustion defense)
+        if let Some(ref raw) = tx.raw_evm {
+            if raw.len() > MAX_RAW_EVM_BYTES {
+                return Err(format!(
+                    "Transaction raw_evm payload exceeds maximum allowed size: {} > {} bytes",
+                    raw.len(), MAX_RAW_EVM_BYTES
+                ));
+            }
+        }
+
+        if tx.program.len() > MAX_PROGRAM_BYTES {
+            return Err(format!(
+                "Transaction program payload exceeds maximum allowed size: {} > {} bytes",
+                tx.program.len(), MAX_PROGRAM_BYTES
+            ));
+        }
+
+        let tx_serialized_len = tx.to_bytes().len();
+        if tx_serialized_len > MAX_TX_SERIALIZED_BYTES {
+            return Err(format!(
+                "Transaction serialized size exceeds maximum allowed limit: {} > {} bytes",
+                tx_serialized_len, MAX_TX_SERIALIZED_BYTES
+            ));
+        }
 
         // 1. Cross-Chain Isolation: discard tx forged for another network
         let chain_matches = tx.chain_id == self.chain_id || tx.chain_id == format!("{}", self.evm_chain_id);
@@ -328,7 +511,7 @@ impl FullNode {
         }
 
         // 3. Cryptographic Signature Verification
-        if let Err(e) = tx.verify_signature() {
+        if let Err(e) = crate::state_transition::verify_signature_cached(&tx) {
             let inc_id = format!("INC-{}", now_ts % 100000);
             self.record_security_incident(SecurityIncident {
                 id: inc_id,
@@ -408,11 +591,12 @@ impl FullNode {
         }
 
         let hash = tx.tx_hash();
-        // 4.3 Reject duplicate transaction or repeated nonce in mempool
-        if self.mempool.iter().any(|t| t.tx_hash() == hash) {
-            return Err("Duplicate transaction already present in mempool".to_string());
-        }
-        if self.mempool.iter().any(|t| t.sender == tx.sender && t.nonce == tx.nonce) {
+        // 4.3 Reject duplicate transaction or repeated nonce in mempool. A duplicate has
+        // the same (sender, nonce), so only that one candidate is hashed.
+        if let Some(t) = self.mempool.iter().find(|t| t.sender == tx.sender && t.nonce == tx.nonce) {
+            if t.tx_hash() == hash {
+                return Err("Duplicate transaction already present in mempool".to_string());
+            }
             return Err(format!(
                 "Repeated nonce: pending transaction already exists in mempool with nonce {} for account 0x{}",
                 tx.nonce, hex::encode(tx.sender)
@@ -421,6 +605,8 @@ impl FullNode {
 
         // 4.4 Strict simulation in current state before admitting to mempool
         let next_height = self.height + 1;
+        // Sender account after this tx, recorded in `admission_cache` once it is admitted.
+        let mut projected_sender: Option<Vec<u8>> = None;
         if tx.nonce == sender_acc.nonce {
             let mut sim_csmt = self.csmt.clone();
             let receipt = crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
@@ -435,6 +621,7 @@ impl FullNode {
             if !receipt.success {
                 return Err("Transaction failed state execution/simulation".to_string());
             }
+            projected_sender = sim_csmt.get(&tx.sender).cloned();
         } else if tx.nonce > sender_acc.nonce {
             // Verify if mempool contains contiguous sequence of preceding nonces
             let mut pending_sender_txs: Vec<&Transaction> = self.mempool
@@ -454,7 +641,26 @@ impl FullNode {
                 }
             }
 
-            if is_contiguous {
+            // Fast path: the sender's account after its pending chain is already known.
+            let cached = self.admission_cache.get(&tx.sender)
+                .filter(|(h, next, _)| *h == self.height && *next == tx.nonce)
+                .map(|(_, _, acc)| acc.clone());
+            if is_contiguous && cached.is_some() {
+                let mut sim_csmt = self.csmt.clone();
+                sim_csmt.insert(tx.sender, cached.unwrap());
+                let receipt = crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
+                    &mut sim_csmt,
+                    &tx,
+                    self.address,
+                    next_height,
+                    now_ts,
+                    self.evm_chain_id,
+                ).map_err(|e| format!("Future transaction rejected during simulation: {}", e))?;
+                if !receipt.success {
+                    return Err("Future transaction failed state execution/simulation".to_string());
+                }
+                projected_sender = sim_csmt.get(&tx.sender).cloned();
+            } else if is_contiguous {
                 let mut sim_csmt = self.csmt.clone();
                 for ptx in &pending_sender_txs {
                     let r = crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
@@ -482,22 +688,62 @@ impl FullNode {
                 if !receipt.success {
                     return Err("Future transaction failed state execution/simulation".to_string());
                 }
+                projected_sender = sim_csmt.get(&tx.sender).cloned();
             }
             // If gap exists, accept as legitimate future nonce awaiting missing sequence.
         }
 
-        // 5. Bounded Mempool Protection (Prevent RAM/Disk exhaustion)
-        if self.mempool.len() >= MAX_MEMPOOL_SIZE {
+        // 5. Bounded Mempool Protection (Prevent RAM/Disk exhaustion by count and total bytes)
+        let current_mempool_bytes: usize = match self.mempool_bytes {
+            Some(b) => b,
+            None => {
+                let b = self.mempool.iter().map(|t| t.to_bytes().len()).sum();
+                self.mempool_bytes = Some(b);
+                b
+            }
+        };
+        if self.mempool.len() >= MAX_MEMPOOL_SIZE || current_mempool_bytes.saturating_add(tx_serialized_len) > MAX_MEMPOOL_BYTES {
             // Sort by gas_price to apply eviction policy (RBF)
             self.mempool.sort_by_key(|t| t.gas_price);
             if tx.gas_price <= self.mempool[0].gas_price {
-                return Err("Mempool is full: Insufficient gas price for transaction eviction".to_string());
+                if current_mempool_bytes.saturating_add(tx_serialized_len) > MAX_MEMPOOL_BYTES {
+                    return Err(format!(
+                        "Mempool is full by bytes: total size {} exceeds limit of {} bytes",
+                        current_mempool_bytes.saturating_add(tx_serialized_len), MAX_MEMPOOL_BYTES
+                    ));
+                } else {
+                    return Err("Mempool is full: Insufficient gas price for transaction eviction".to_string());
+                }
             }
-            self.mempool.remove(0); // Remove lowest fee transaction
+            // Evict lowest fee transactions until both count and byte constraints are satisfied
+            while !self.mempool.is_empty()
+                && (self.mempool.len() >= MAX_MEMPOOL_SIZE
+                    || self.mempool.iter().map(|t| t.to_bytes().len()).sum::<usize>().saturating_add(tx_serialized_len) > MAX_MEMPOOL_BYTES)
+            {
+                if tx.gas_price <= self.mempool[0].gas_price {
+                    return Err("Mempool is full: Insufficient gas price for transaction eviction".to_string());
+                }
+                self.mempool.remove(0); // Remove lowest fee transaction
+                self.admission_cache.clear();
+                self.mempool_bytes = None;
+            }
         }
 
+        if let Some(acc) = projected_sender {
+            if self.admission_cache.len() >= MAX_MEMPOOL_SIZE {
+                self.admission_cache.clear();
+            }
+            self.admission_cache.insert(tx.sender, (self.height, tx.nonce + 1, acc));
+        }
+        if let Some(b) = self.mempool_bytes.as_mut() {
+            *b += tx_serialized_len;
+        }
         self.mempool.push(tx);
-        let _ = self.storage.save_mempool(&self.mempool);
+        // Persisted by `flush_mempool_if_dirty` (node loop, every second): rewriting the
+        // whole mempool file on every admission cost 8.5 ms per tx at 1,500 pending.
+        // The mempool is not consensus state; at worst ~1 s of pending txs is lost on a
+        // crash and their senders resubmit.
+        self.mempool_dirty = true;
         Ok(hash)
     }
 
@@ -508,30 +754,44 @@ impl FullNode {
         if initial_len == 0 {
             return 0;
         }
+        let keep = Self::full_prune_keep(&self.csmt, &self.mempool, self.address, self.height + 1, self.evm_chain_id);
+        self.mempool.retain(|t| keep.contains(&t.tx_hash()));
+        self.admission_cache.clear();
+        self.mempool_bytes = None;
+        self.last_full_prune = Some(std::time::Instant::now());
+        self.full_prune_requested = false;
+        if self.mempool.len() != initial_len {
+            self.mempool_dirty = true; // saved by flush_mempool_if_dirty
+        }
+        initial_len - self.mempool.len()
+    }
 
+    /// Hashes of the pending txs a full prune keeps (pure). Executes each sender's txs in
+    /// nonce order on a copy of `csmt`: drops used nonces, senders without an account,
+    /// txs that fail their rules, and txs too far past the sender's next nonce.
+    pub fn full_prune_keep(csmt: &CSMT, mempool: &[Transaction], proposer: Address, next_height: u64, evm_chain_id: u64) -> std::collections::HashSet<[u8; 32]> {
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let next_height = self.height + 1;
 
         // Group by sender
         let mut by_sender: std::collections::HashMap<crate::account::Address, Vec<Transaction>> = std::collections::HashMap::new();
-        for tx in self.mempool.drain(..) {
+        for tx in mempool.iter().cloned() {
             by_sender.entry(tx.sender).or_default().push(tx);
         }
 
-        let mut valid_txs = Vec::new();
+        let mut keep = std::collections::HashSet::new();
 
         for (sender, mut txs) in by_sender {
-            let sender_acc = match self.csmt.get(&sender).and_then(|b| Account::from_bytes(b).ok()) {
+            let sender_acc = match csmt.get(&sender).and_then(|b| Account::from_bytes(b).ok()) {
                 Some(acc) => acc,
                 None => continue, // Discard if account does not exist in CSMT
             };
 
             txs.sort_by_key(|t| t.nonce);
 
-            let mut sim_csmt = self.csmt.clone();
+            let mut sim_csmt = csmt.clone();
             let mut expected_nonce = sender_acc.nonce;
 
             for tx in txs {
@@ -545,14 +805,14 @@ impl FullNode {
                     match crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
                         &mut sim_csmt,
                         &tx,
-                        self.address,
+                        proposer,
                         next_height,
                         now_ts,
-                        self.evm_chain_id,
+                        evm_chain_id,
                     ) {
                         Ok(receipt) if receipt.success => {
                             expected_nonce += 1;
-                            valid_txs.push(tx);
+                            keep.insert(tx.tx_hash());
                         }
                         _ => {
                             // Failed rule check: pruned!
@@ -562,17 +822,111 @@ impl FullNode {
                 } else if tx.nonce > expected_nonce {
                     // Future nonce (with gap)
                     if tx.nonce <= expected_nonce.saturating_add(MAX_PENDING_NONCE_GAP) {
-                        valid_txs.push(tx);
+                        keep.insert(tx.tx_hash());
                     }
                 }
             }
         }
 
-        self.mempool = valid_txs;
-        if self.mempool.len() != initial_len {
-            let _ = self.storage.save_mempool(&self.mempool);
+        keep
+    }
+
+    /// True when a full prune should run (requested by a build that saw rejected txs, or
+    /// FULL_PRUNE_EVERY since the last one, with something pending).
+    pub fn full_prune_due(&self) -> bool {
+        !self.mempool.is_empty()
+            && (self.full_prune_requested || self.last_full_prune.map_or(true, |t| t.elapsed() >= FULL_PRUNE_EVERY))
+    }
+
+    /// State and pending txs for a full prune computed with no lock held (O(1) state copy).
+    pub fn full_prune_snapshot(&self) -> FullPruneSnapshot {
+        FullPruneSnapshot {
+            csmt: self.csmt.clone(),
+            mempool: self.mempool.clone(),
+            proposer: self.address,
+            next_height: self.height + 1,
+            evm_chain_id: self.evm_chain_id,
         }
-        initial_len - self.mempool.len()
+    }
+
+    /// The txs of `snap` a full prune would drop, each with its sender's account bytes in
+    /// the snapshot (pure; runs off the node lock).
+    pub fn compute_full_prune(snap: FullPruneSnapshot) -> FullPruneResult {
+        let keep = Self::full_prune_keep(&snap.csmt, &snap.mempool, snap.proposer, snap.next_height, snap.evm_chain_id);
+        let drop = snap.mempool.iter()
+            .filter(|t| !keep.contains(&t.tx_hash()))
+            .map(|t| (t.tx_hash(), t.sender, snap.csmt.get(&t.sender).cloned()))
+            .collect();
+        FullPruneResult { drop }
+    }
+
+    /// Applies a full prune computed on an older state. A tx is dropped only if its
+    /// sender's account is still exactly as in the snapshot (otherwise its verdict may be
+    /// stale: e.g. it received funds since); txs added after the snapshot are untouched.
+    pub fn apply_full_prune(&mut self, result: FullPruneResult) -> usize {
+        let drop: std::collections::HashSet<[u8; 32]> = result.drop.into_iter()
+            .filter(|(_, sender, acc)| self.csmt.get(sender).cloned() == *acc)
+            .map(|(h, _, _)| h)
+            .collect();
+        self.last_full_prune = Some(std::time::Instant::now());
+        self.full_prune_requested = false;
+        if drop.is_empty() {
+            return 0;
+        }
+        let before = self.mempool.len();
+        self.mempool.retain(|t| !drop.contains(&t.tx_hash()));
+        let pruned = before - self.mempool.len();
+        if pruned > 0 {
+            self.admission_cache.clear();
+            self.mempool_bytes = None;
+            self.mempool_dirty = true;
+        }
+        pruned
+    }
+
+    /// Cheap prune after a block: drops pending txs whose nonce was used (or whose
+    /// sender has no account), and future txs beyond MAX_PENDING_NONCE_GAP past the
+    /// sender's contiguous run, without executing anything. Txs that would now fail
+    /// their rules (e.g. balance) are left for the full prune.
+    pub fn prune_mempool_nonces(&mut self) -> usize {
+        let initial_len = self.mempool.len();
+        if initial_len == 0 {
+            return 0;
+        }
+        let mut by_sender: std::collections::HashMap<Address, Vec<u64>> = std::collections::HashMap::new();
+        for tx in &self.mempool {
+            by_sender.entry(tx.sender).or_default().push(tx.nonce);
+        }
+        // sender -> (account nonce, end of the contiguous run of pending nonces)
+        let mut bounds: std::collections::HashMap<Address, (u64, u64)> = std::collections::HashMap::new();
+        for (sender, mut nonces) in by_sender {
+            let acc = match self.csmt.get(&sender).and_then(|b| Account::from_bytes(b).ok()) {
+                Some(acc) => acc,
+                None => continue, // no account: all its txs go
+            };
+            nonces.sort_unstable();
+            nonces.dedup();
+            let mut end = acc.nonce;
+            for n in nonces {
+                if n == end {
+                    end += 1;
+                } else if n > end {
+                    break;
+                }
+            }
+            bounds.insert(sender, (acc.nonce, end));
+        }
+        self.mempool.retain(|tx| match bounds.get(&tx.sender) {
+            Some(&(acc_nonce, end)) => tx.nonce >= acc_nonce && tx.nonce <= end.saturating_add(MAX_PENDING_NONCE_GAP),
+            None => false,
+        });
+        let pruned = initial_len - self.mempool.len();
+        if pruned > 0 {
+            self.admission_cache.clear();
+            self.mempool_bytes = None;
+            self.mempool_dirty = true;
+        }
+        pruned
     }
 
     /// Selected proposer packages mempool transactions and creates next block
@@ -652,19 +1006,82 @@ impl FullNode {
     /// state copy to obtain state_root and signs proposer PreCommit vote.
     /// Real commit occurs in apply_block when 2/3 + 1 votes arrive.
     pub async fn build_proposal(&mut self) -> Result<Block, String> {
-        let key = self.keypair.clone().ok_or("Node has no validator key to propose")?;
-        self.prune_mempool();
-        let next_height = self.height + 1;
-        let mut txs_to_include = self.mempool.clone();
+        let inp = self.build_inputs()?;
+        let built = Self::build_block(inp).await?;
+        Ok(self.finish_build(built))
+    }
+
+    /// Everything `build_block` needs, taken under the node lock. Cheap: the state tree is
+    /// copy-on-write (O(1) clone), so the lock is held only for this copy.
+    pub fn build_inputs(&self) -> Result<BuildInputs, String> {
+        Ok(BuildInputs {
+            key: self.keypair.clone().ok_or("Node has no validator key to propose")?,
+            chain_id: self.chain_id.clone(),
+            evm_chain_id: self.evm_chain_id,
+            next_height: self.height + 1,
+            prev_hash: self.latest_block_hash,
+            address: self.address,
+            last_committed_signatures: self.last_committed_signatures.clone(),
+            last_commit_round: self.last_commit_round,
+            mempool: self.mempool.clone(),
+            csmt: self.csmt.clone(),
+        })
+    }
+
+    /// Stores what a build produced: the execution for apply_block, the mempool txs the
+    /// proposer policy dropped, and a full prune if execution rejected candidates.
+    /// Ignored if the chain moved on while the block was being built.
+    pub fn finish_build(&mut self, built: BuiltBlock) -> Block {
+        if built.exec.base_hash == self.latest_block_hash {
+            if !built.dropped_from_mempool.is_empty() {
+                let dropped: std::collections::HashSet<[u8; 32]> = built.dropped_from_mempool.iter().copied().collect();
+                self.mempool.retain(|m| !dropped.contains(&m.tx_hash()));
+                self.admission_cache.clear();
+                self.mempool_bytes = None;
+                self.mempool_dirty = true;
+            }
+            if let Ok(mut c) = self.exec_cache.lock() {
+                *c = Some(built.exec);
+            }
+            if built.rejected_txs {
+                self.full_prune_requested = true;
+            }
+        }
+        built.block
+    }
+
+    /// Builds and executes a proposal from `inp` without touching the node, so it can run
+    /// with no lock held (block execution takes hundreds of ms with thousands of txs).
+    pub async fn build_block(inp: BuildInputs) -> Result<BuiltBlock, String> {
+        let key = inp.key.clone();
+        // No prune_mempool() here: it executed every pending tx only to drop failing ones,
+        // and execute_block below already omits unapplicable txs (apply_block also prunes
+        // after every block).
+        let next_height = inp.next_height;
+        let mut txs_to_include = inp.mempool;
         txs_to_include.sort_by(|a, b| {
             a.sender.cmp(&b.sender).then_with(|| a.nonce.cmp(&b.nonce))
         });
-        // Tx cap per block (limits block size and execution within round)
+        // Tx cap per block (cheap pre-filter)
         const MAX_TXS_PER_BLOCK: usize = 5000;
-        txs_to_include.truncate(MAX_TXS_PER_BLOCK);
+        let mut limited_txs = Vec::new();
+        let mut accumulated_bytes = 0usize;
+        for tx in txs_to_include {
+            if limited_txs.len() >= MAX_TXS_PER_BLOCK {
+                break;
+            }
+            let tx_bytes = tx.to_bytes().len();
+            if !limited_txs.is_empty() && accumulated_bytes.saturating_add(tx_bytes) > MAX_BLOCK_TX_BYTES {
+                break;
+            }
+            accumulated_bytes = accumulated_bytes.saturating_add(tx_bytes);
+            limited_txs.push(tx);
+        }
+        let mut candidate_txs = limited_txs;
+        let mut dropped_from_mempool: Vec<[u8; 32]> = Vec::new();
 
         let last_commit = if next_height > 1 {
-            let mut c = self.last_committed_signatures.clone();
+            let mut c = inp.last_committed_signatures.clone();
             Block::canonicalize_commits(&mut c);
             c
         } else {
@@ -672,56 +1089,174 @@ impl FullNode {
         };
         let last_commit_hash = Block::compute_commits_root(&last_commit);
 
-        let mut block = Block::new(
-            BlockHeader {
-                height: next_height,
-                prev_hash: self.latest_block_hash,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                state_root: [0u8; 32],
-                tx_root: [0u8; 32],
-                receipts_root: [0u8; 32],
-                proposer: self.address,
-                last_commit_hash,
-            },
-            txs_to_include.clone(),
-            Vec::new(),
-        );
-        block.last_commit = last_commit;
+        loop {
+            if candidate_txs.is_empty() {
+                return Err("No applicable transactions at this moment".to_string());
+            }
 
-        // Execute on a state COPY solely to populate state_root/tx_root (does not mutate real state)
-        let mut sim_csmt = self.csmt.clone();
-        StateTransitionEngine::execute_block(&mut sim_csmt, &mut block, self.evm_chain_id).await?;
-        if block.transactions.len() != txs_to_include.len() {
-            self.prune_mempool();
+            let mut block = Block::new(
+                BlockHeader {
+                    height: next_height,
+                    prev_hash: inp.prev_hash,
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    state_root: [0u8; 32],
+                    tx_root: [0u8; 32],
+                    receipts_root: [0u8; 32],
+                    proposer: inp.address,
+                    last_commit_hash,
+                },
+                candidate_txs.clone(),
+                Vec::new(),
+            );
+            block.last_commit = last_commit.clone();
+            block.last_commit_round = inp.last_commit_round;
+
+            // Execute on a state COPY solely to populate state_root/tx_root
+            let mut sim_csmt = inp.csmt.clone();
+            StateTransitionEngine::execute_block(&mut sim_csmt, &mut block, inp.evm_chain_id).await?;
+
+            // 1. Proposer policy: check if any transaction exceeded MAX_TX_LOGS_BYTES (256 KiB)
+            let mut dropped_oversized_log_tx = false;
+            for (tx, receipt) in block.transactions.iter().zip(block.receipts.iter()) {
+                let logs_bytes = serde_json::to_vec(&receipt.logs).map(|v| v.len()).unwrap_or(0);
+                if logs_bytes > MAX_TX_LOGS_BYTES {
+                    eprintln!(
+                        "⚠️ [Proposer Policy] Transaction 0x{} generated {} bytes of logs exceeding MAX_TX_LOGS_BYTES ({} bytes). Dropping from mempool.",
+                        hex::encode(tx.tx_hash()), logs_bytes, MAX_TX_LOGS_BYTES
+                    );
+                    dropped_from_mempool.push(tx.tx_hash());
+                    let th = tx.tx_hash(); candidate_txs.retain(|c| c.tx_hash() != th);
+                    dropped_oversized_log_tx = true;
+                }
+            }
+            if dropped_oversized_log_tx {
+                continue; // Re-execute without oversized log transactions
+            }
+
+            if block.transactions.is_empty() {
+                return Err("No applicable transactions at this moment".to_string());
+            }
+
+            // Proposer PreCommit vote over block hash
+            let vote = Vote::new(
+                &inp.chain_id,
+                next_height,
+                0,
+                block.hash(),
+                VoteType::PreCommit,
+                &key,
+            );
+            block.validator_signatures.clear();
+            block.validator_signatures.push(ValidatorCommit::new(vote.validator_pubkey, vote.signature));
+
+            // 2. Measure complete block wire frame with P2PPayload::BlockProposal envelope
+            let proposal_payload = crate::p2p::P2PPayload::BlockProposal(block.clone());
+            let frame_bytes = 1 + serde_json::to_vec(&proposal_payload)
+                .map(|v| v.len())
+                .unwrap_or(0);
+
+            if frame_bytes > MAX_BLOCK_WIRE_BYTES {
+                eprintln!(
+                    "⚠️ [Proposer Wire Check] Block #{} proposal frame size {} exceeds MAX_BLOCK_WIRE_BYTES ({}) with {} txs. Trimming from end.",
+                    next_height, frame_bytes, MAX_BLOCK_WIRE_BYTES, candidate_txs.len()
+                );
+                if candidate_txs.len() <= 1 {
+                    return Err(format!(
+                        "Single transaction block proposal frame {} bytes exceeds MAX_BLOCK_WIRE_BYTES {}",
+                        frame_bytes, MAX_BLOCK_WIRE_BYTES
+                    ));
+                }
+                let excess = frame_bytes.saturating_sub(MAX_BLOCK_WIRE_BYTES);
+                let mut bytes_trimmed = 0usize;
+                let mut trim_count = 0usize;
+                for tx in candidate_txs.iter().rev() {
+                    bytes_trimmed += tx.to_bytes().len();
+                    trim_count += 1;
+                    if bytes_trimmed >= excess {
+                        break;
+                    }
+                }
+                trim_count = trim_count.max(1).min(candidate_txs.len().saturating_sub(1));
+                let new_len = candidate_txs.len() - trim_count;
+                candidate_txs.truncate(new_len);
+                continue; // Re-execute with trimmed transactions
+            }
+
+            let exec = ExecutedBlock {
+                base_hash: inp.prev_hash,
+                block_hash: block.hash(),
+                csmt: sim_csmt,
+                roots: (block.header.state_root, block.header.tx_root, block.header.receipts_root),
+            };
+            // Execution left out some candidates: they fail their rules now, so the full
+            // prune should drop them. (A mempool larger than the block is normal under load.)
+            let rejected_txs = block.transactions.len() < candidate_txs.len();
+            return Ok(BuiltBlock { block, exec, dropped_from_mempool, rejected_txs });
         }
-        // After filtering applicable txs: do not propose empty block
-        if block.transactions.is_empty() {
-            return Err("No applicable transactions at this moment".to_string());
-        }
-
-        // Proposer PreCommit vote over block hash (which does NOT include signatures)
-        let vote = Vote::new(
-            &self.chain_id,
-            next_height,
-            0,
-            block.hash(),
-            VoteType::PreCommit,
-            &key,
-        );
-        block.validator_signatures.push(ValidatorCommit::new(vote.validator_pubkey, vote.signature));
-
-        Ok(block)
     }
 
     /// Phase 3 (follower): validates state transition of a PROPOSED block before voting.
     /// Re-executes ALL txs on a copy and requires recomputed roots match the
     /// signed header. An honest validator NEVER signs without verifying state.
     pub async fn validate_proposal(&self, block: &Block) -> Result<(), String> {
-        let mut sim = self.csmt.clone();
-        let (sr, txr, rr) = StateTransitionEngine::validate_block_strict(&mut sim, block, self.evm_chain_id).await?;
+        let block_tx_bytes: usize = block.transactions.iter().map(|t| t.to_bytes().len()).sum();
+        if block_tx_bytes > MAX_BLOCK_TX_BYTES {
+            eprintln!(
+                "⚠️ [Consensus Warning] Block #{} proposal payload exceeds 2.5 MiB ({} bytes, {} txs)",
+                block.header.height, block_tx_bytes, block.transactions.len()
+            );
+        }
+
+        let (exec, _) = Self::execute_proposal(self.exec_snapshot(), block).await?;
+        if let Ok(mut c) = self.exec_cache.lock() {
+            *c = Some(exec);
+        }
+        Ok(())
+    }
+
+    /// The pending txs with these hashes, in that order, or how many are missing.
+    pub fn mempool_txs_by_hash(&self, hashes: &[[u8; 32]]) -> Result<Vec<Transaction>, usize> {
+        let found = self.mempool_lookup(hashes);
+        let missing = found.iter().filter(|t| t.is_none()).count();
+        if missing > 0 {
+            return Err(missing);
+        }
+        Ok(found.into_iter().flatten().collect())
+    }
+
+    /// For each hash, the pending tx with that hash (None if not in the mempool).
+    pub fn mempool_lookup(&self, hashes: &[[u8; 32]]) -> Vec<Option<Transaction>> {
+        let wanted: std::collections::HashSet<&[u8; 32]> = hashes.iter().collect();
+        let mut found: std::collections::HashMap<[u8; 32], &Transaction> = std::collections::HashMap::with_capacity(hashes.len());
+        for tx in &self.mempool {
+            let h = tx.tx_hash();
+            if wanted.contains(&h) {
+                found.insert(h, tx);
+            }
+        }
+        hashes.iter().map(|h| found.get(h).map(|t| (*t).clone())).collect()
+    }
+
+    /// State and parameters to execute a proposal on, taken under the node lock (O(1)).
+    pub fn exec_snapshot(&self) -> ExecSnapshot {
+        ExecSnapshot { csmt: self.csmt.clone(), evm_chain_id: self.evm_chain_id, base_hash: self.latest_block_hash }
+    }
+
+    /// Stores a proposal execution for apply_block (ignored there if the base moved on).
+    pub fn store_execution(&self, exec: ExecutedBlock) {
+        if let Ok(mut c) = self.exec_cache.lock() {
+            *c = Some(exec);
+        }
+    }
+
+    /// Re-executes every tx of `block` on the snapshot and requires the header roots to
+    /// match. Touches no node state, so it can run with no lock held.
+    pub async fn execute_proposal(snap: ExecSnapshot, block: &Block) -> Result<(ExecutedBlock, Vec<crate::account::ExecutionReceipt>), String> {
+        let mut sim = snap.csmt;
+        let ((sr, txr, rr), receipts) = StateTransitionEngine::validate_block_strict_with_receipts(&mut sim, block, snap.evm_chain_id).await?;
         if sr != block.header.state_root {
             return Err(format!(
                 "state_root mismatch: calc 0x{} != claimed 0x{}",
@@ -734,11 +1269,91 @@ impl FullNode {
         if rr != block.header.receipts_root {
             return Err("receipts_root mismatch".to_string());
         }
+        Ok((ExecutedBlock { base_hash: snap.base_hash, block_hash: block.hash(), csmt: sim, roots: (sr, txr, rr) }, receipts))
+    }
+
+    /// Checks a Tendermint proposal's block against everything `apply_block` will check,
+    /// except its own commit certificate (it does not exist yet), so a validator never
+    /// votes for a block it could not apply once decided.
+    pub async fn validate_tm_proposal(&self, block: &Block, proposal_round: u64) -> Result<(), String> {
+        let snap = self.tm_proposal_precheck(block, proposal_round)?;
+        let (exec, _) = Self::execute_proposal(snap, block).await?;
+        self.store_execution(exec);
         Ok(())
+    }
+
+    /// Every check of `validate_tm_proposal` except the re-execution (cheap; done under
+    /// the node lock). Returns the state to execute the proposal on.
+    pub fn tm_proposal_precheck(&self, block: &Block, proposal_round: u64) -> Result<ExecSnapshot, String> {
+        let h = block.header.height;
+        if h != self.height + 1 {
+            return Err(format!("proposal height {} (expected {})", h, self.height + 1));
+        }
+        if !self.tendermint_active(h) {
+            return Err(format!("height {} is before Tendermint activation", h));
+        }
+        if block.header.prev_hash != self.latest_block_hash {
+            return Err("proposal prev_hash does not match our latest block".to_string());
+        }
+        if !block.validator_signatures.is_empty() || block.commit_round != 0 {
+            return Err("a proposal must not carry a commit certificate".to_string());
+        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if block.header.timestamp > now_secs.saturating_add(MAX_FUTURE_BLOCK_TIME_SECS) {
+            return Err(format!("proposal timestamp {} is in the future", block.header.timestamp));
+        }
+        if let Ok(Some(prev)) = self.storage.load_block(self.height) {
+            if block.header.timestamp < prev.header.timestamp {
+                return Err("proposal timestamp is older than the previous block".to_string());
+            }
+        }
+        let max_round = proposal_round.min(MAX_TENDERMINT_COMMIT_ROUND);
+        let proposer_ok = (0..=max_round).any(|r| {
+            self.validator_set.get_proposer(h, r).map(|p| p.address == block.header.proposer).unwrap_or(false)
+        });
+        if !proposer_ok {
+            let expected: Vec<String> = (0..=max_round.min(3))
+                .filter_map(|r| self.validator_set.get_proposer(h, r).ok().map(|p| hex::encode(&p.address[..4])))
+                .collect();
+            return Err(format!("block was not built by a proposer of this height (expected one of {:?} for rounds 0..={}, local height {})",
+                expected, max_round, self.height));
+        }
+        if block.header.last_commit_hash != Block::compute_commits_root(&block.last_commit) {
+            return Err("last_commit does not match header.last_commit_hash".to_string());
+        }
+        if h > 1 && !self.validator_set.check_commit_supermajority(
+            &self.chain_id, h - 1, block.last_commit_round, &block.header.prev_hash, &block.last_commit,
+        )? {
+            return Err("last_commit lacks a quorum for the previous block".to_string());
+        }
+        let block_tx_bytes: usize = block.transactions.iter().map(|t| t.to_bytes().len()).sum();
+        if block_tx_bytes > MAX_BLOCK_TX_BYTES {
+            eprintln!("⚠️ [Consensus Warning] Block #{} proposal payload exceeds 2.5 MiB ({} bytes, {} txs)",
+                block.header.height, block_tx_bytes, block.transactions.len());
+        }
+        Ok(self.exec_snapshot())
+    }
+
+    /// Saves the mempool if it changed since the last save.
+    pub fn flush_mempool_if_dirty(&mut self) {
+        if self.mempool_dirty {
+            if self.storage.save_mempool(&self.mempool).is_ok() {
+                self.mempool_dirty = false;
+            }
+        }
+    }
+
+    /// True when `height` is decided by the Tendermint engine.
+    pub fn tendermint_active(&self, height: u64) -> bool {
+        self.tendermint_activation.map_or(false, |a| height >= a)
     }
 
     /// Validates and applies a block received from P2P network with strict BFT consensus verification
     pub async fn apply_block(&mut self, block: Block) -> Result<[u8; 32], String> {
+        let mut stages = StageTimer::new();
         if block.header.height != self.height + 1 {
             return Err(format!(
                 "Unexpected block height: {} (expected {})",
@@ -779,7 +1394,10 @@ impl FullNode {
                 block.header.timestamp, now_secs, MAX_FUTURE_BLOCK_TIME_SECS
             ));
         }
-        if let Ok(Some(prev_block)) = self.storage.load_block(self.height) {
+        stages.mark("checks");
+        let prev_loaded = self.storage.load_block(self.height);
+        stages.mark("load_prev");
+        if let Ok(Some(prev_block)) = prev_loaded {
             if block.header.timestamp < prev_block.header.timestamp {
                 let now_ts = now_secs;
                 self.record_security_incident(SecurityIncident {
@@ -802,8 +1420,18 @@ impl FullNode {
             }
         }
 
-        // 2. Deterministic Proposer Validation (permits round advance if validator misses)
-        let is_valid_proposer = (0..=10u64).any(|r| {
+        // 2. Deterministic Proposer Validation (permits round advance if validator misses).
+        //    Tendermint: the block was built by the proposer of some round <= its commit
+        //    round (later rounds re-propose it unchanged). Legacy: rounds 0..=10, round 0 commits.
+        let tm = self.tendermint_active(block.header.height);
+        if !tm && (block.commit_round != 0 || block.last_commit_round != 0) {
+            return Err(format!("Block #{}: commit rounds must be 0 before Tendermint activation", block.header.height));
+        }
+        if block.commit_round > MAX_TENDERMINT_COMMIT_ROUND {
+            return Err(format!("Block #{}: commit round {} too high", block.header.height, block.commit_round));
+        }
+        let max_proposer_round = if tm { block.commit_round } else { 10 };
+        let is_valid_proposer = (0..=max_proposer_round).any(|r| {
             self.validator_set.get_proposer(block.header.height, r)
                 .map(|p| p.address == block.header.proposer)
                 .unwrap_or(false)
@@ -840,7 +1468,7 @@ impl FullNode {
         let supermajority_ok = self.validator_set.check_commit_supermajority(
             &self.chain_id,
             block.header.height,
-            0,
+            block.commit_round,
             &block_hash,
             &block.validator_signatures,
         )?;
@@ -874,7 +1502,7 @@ impl FullNode {
             let last_commit_supermajority = self.validator_set.check_commit_supermajority(
                 &self.chain_id,
                 block.header.height - 1,
-                0,
+                block.last_commit_round,
                 &block.header.prev_hash,
                 &block.last_commit,
             )?;
@@ -889,13 +1517,25 @@ impl FullNode {
         // 4. STRICT validation of state transition against claimed proposer root.
         //    Does NOT overwrite header; re-executes ALL txs (fails if any does not apply)
         //    and compares recomputed roots with those in block signed by 2/3 + 1.
+        stages.mark("proposer+commits");
         let claimed_state_root = block.header.state_root;
         let claimed_tx_root = block.header.tx_root;
         let claimed_receipts_root = block.header.receipts_root;
-        let mut sim_csmt = self.csmt.clone();
-        let (calculated_state_root, calculated_tx_root, calculated_receipts_root) =
-            StateTransitionEngine::validate_block_strict(&mut sim_csmt, &block, self.evm_chain_id).await?;
+        let block_hash_now = block.hash();
+        let cached = self.exec_cache.lock().ok().and_then(|mut c| c.take())
+            .filter(|e| e.base_hash == self.latest_block_hash && e.block_hash == block_hash_now);
+        let cache_hit = cached.is_some();
+        let (sim_csmt, (calculated_state_root, calculated_tx_root, calculated_receipts_root)) = match cached {
+            // Same block on the same state was already executed (build or validation).
+            Some(e) => (e.csmt, e.roots),
+            None => {
+                let mut sim_csmt = self.csmt.clone();
+                let roots = StateTransitionEngine::validate_block_strict(&mut sim_csmt, &block, self.evm_chain_id).await?;
+                (sim_csmt, roots)
+            }
+        };
 
+        stages.mark(if cache_hit { "exec(cached)" } else { "exec" });
         if calculated_state_root != claimed_state_root
             || calculated_tx_root != claimed_tx_root
             || calculated_receipts_root != claimed_receipts_root
@@ -931,43 +1571,59 @@ impl FullNode {
             }
         }
 
-        // State validated! Commit permanently without ANY state mutation outside the block
+        // State validated! Commit permanently without ANY state mutation outside the block.
+        // Accounts this block changed (the base was compacted after the previous block):
+        // written to the delta log before the block, so disk state never runs ahead.
+        let state_delta = sim_csmt.delta_entries();
+        self.storage.append_state_delta(block.header.height, &state_delta)?;
+        stages.mark("state_delta");
         self.csmt = sim_csmt;
+        // The previous state (the only other holder of the shared base) is gone now.
+        self.csmt.compact();
+        stages.mark("compact");
         self.last_committed_signatures = block.validator_signatures.clone();
+        self.last_commit_round = block.commit_round;
         self.height = block.header.height;
         self.latest_block_hash = block.hash();
         self.storage.save_block(&block)?;
-        self.storage.save_state(&self.csmt)?;
+        stages.mark("save_block");
+        // Full snapshot only every STATE_SNAPSHOT_EVERY blocks (or if the log grew large):
+        // rewriting the whole state on every block cost 0.4 s per block at 100k accounts.
+        if block.header.height % STATE_SNAPSHOT_EVERY == 0 || self.storage.delta_log_bytes() > MAX_DELTA_LOG_BYTES {
+            self.storage.save_state(&self.csmt)?;
+        }
         let _ = self.storage.save_validators(&self.validator_set);
+        stages.mark("snapshot+validators");
 
         // Remove executed transactions from mempool and prune rule-failing transactions
         let executed_hashes: std::collections::HashSet<[u8; 32]> =
             block.transactions.iter().map(|tx| tx.tx_hash()).collect();
         self.mempool.retain(|tx| !executed_hashes.contains(&tx.tx_hash()));
-        self.prune_mempool();
-        let _ = self.storage.save_mempool(&self.mempool);
+        self.admission_cache.clear();
+        self.mempool_bytes = None;
+        self.mempool_dirty = true; // saved by flush_mempool_if_dirty (every second)
+        stages.mark("mempool_retain");
+        // Cheap prune only; the full one (re-executes pending txs) runs off the lock from
+        // the node's event loop (full_prune_due / compute_full_prune / apply_full_prune).
+        self.prune_mempool_nonces();
+        stages.mark("prune(nonces)");
 
-        for (idx, tx) in block.transactions.iter().enumerate() {
-            self.tx_index.insert(tx.tx_hash(), (block.header.height, idx));
-            self.recent_transactions.insert(0, TxRecord {
-                hash: format!("0x{}", hex::encode(tx.tx_hash())),
-                block_number: block.header.height,
-                from: format!("0x{}", hex::encode(&tx.sender[12..32])),
-                to: tx.to.as_ref().map(|t| format!("0x{}", hex::encode(&t[12..32]))),
-                value: format!("0x{:x}", tx.amount),
-                tx_type: if tx.to.is_none() {
-                    "CONTRACT_CREATION".to_string()
-                } else if !tx.program.is_empty() {
-                    "CONTRACT_CALL".to_string()
-                } else {
-                    "TRANSFER".to_string()
-                },
-                timestamp: block.header.timestamp,
-                status: "SUCCESS".to_string(),
-            });
+        let hashes: Vec<[u8; 32]> = block.transactions.iter().map(|tx| tx.tx_hash()).collect();
+        for (idx, hash) in hashes.iter().enumerate() {
+            self.tx_index.insert(*hash, (block.header.height, idx));
         }
-        if self.recent_transactions.len() > 100 {
-            self.recent_transactions.truncate(100);
+        let _ = self.storage.append_tx_index(block.header.height, &hashes);
+        // Newest first; only the last MAX_RECENT_TXS of the block can stay in the list.
+        let mut recent: Vec<TxRecord> = block.transactions.iter().rev().take(MAX_RECENT_TXS)
+            .map(|tx| tx_record(tx, block.header.height, block.header.timestamp))
+            .collect();
+        recent.extend(self.recent_transactions.drain(..));
+        recent.truncate(MAX_RECENT_TXS);
+        self.recent_transactions = recent;
+        stages.mark("tx_index");
+        if block.transactions.len() >= TIMING_LOG_MIN_TXS {
+            println!("⏱️ [apply] #{} {} txs, {} pending after | {}",
+                block.header.height, block.transactions.len(), self.mempool.len(), stages.summary());
         }
 
         self.height = block.header.height;
@@ -1254,5 +1910,256 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[tokio::test]
+    async fn test_admission_payload_and_mempool_byte_limits() {
+        use rand::rngs::OsRng;
+        let temp_dir = std::env::temp_dir().join(format!("vera_test_limits_{}", rand::random::<u64>()));
+        let (genesis_cfg, val_key) = GenesisConfig::default_testnet();
+        let mut node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key)).unwrap();
+
+        let test_user_key = SigningKey::generate(&mut OsRng);
+        let test_user_addr = crate::chain_hash::hash256(&test_user_key.verifying_key().to_bytes());
+        node.csmt.insert(test_user_addr, Account::new(100_000_000_000_000_000_000).to_bytes());
+
+        // 1. Rejection of program exceeding 128 KiB
+        let oversized_program_tx = Transaction::new(
+            &node.chain_id,
+            &test_user_key,
+            0,
+            Some([0x22u8; 32]),
+            1000,
+            1_000_000,
+            1,
+            vec![0xAA; 130 * 1024], // 130 KiB > 128 KiB
+        );
+        let res_prog = node.submit_transaction(oversized_program_tx);
+        assert!(res_prog.is_err(), "Program > 128 KiB must be rejected");
+        assert!(res_prog.unwrap_err().contains("Transaction program payload exceeds maximum allowed size"));
+
+        // 2. Rejection of raw_evm exceeding 128 KiB
+        let mut oversized_raw_tx = Transaction::new(
+            &node.chain_id,
+            &test_user_key,
+            0,
+            Some([0x22u8; 32]),
+            1000,
+            1_000_000,
+            1,
+            vec![],
+        );
+        oversized_raw_tx.raw_evm = Some(vec![0xBB; 130 * 1024]); // 130 KiB > 128 KiB
+        let res_raw = node.submit_transaction(oversized_raw_tx);
+        assert!(res_raw.is_err(), "raw_evm > 128 KiB must be rejected");
+        assert!(res_raw.unwrap_err().contains("Transaction raw_evm payload exceeds maximum allowed size"));
+
+        // 3. Rejection when mempool byte limit is reached
+        let dummy_key = SigningKey::generate(&mut OsRng);
+        let dummy_tx = Transaction::new(
+            &node.chain_id,
+            &dummy_key,
+            0,
+            Some([0x22u8; 32]),
+            1000,
+            21_000,
+            1, // gas_price = 1
+            vec![0u8; 1000],
+        );
+        let tx_len = dummy_tx.to_bytes().len();
+        // Fill simulated mempool to 64 MiB
+        let count_to_fill = (MAX_MEMPOOL_BYTES / tx_len) + 1;
+        for i in 0..count_to_fill {
+            let mut t = dummy_tx.clone();
+            t.nonce = i as u64;
+            node.mempool.push(t);
+        }
+
+        // New valid tx from test_user (nonce 0, has account and balance, gas_price = 1)
+        let candidate_tx = Transaction::new(
+            &node.chain_id,
+            &test_user_key,
+            0,
+            Some([0x22u8; 32]),
+            1000,
+            21_000,
+            1, // gas_price = 1 (cannot evict equal fee)
+            vec![],
+        );
+        let res_full = node.submit_transaction(candidate_tx);
+        assert!(res_full.is_err(), "Mempool full by bytes must reject transaction with insufficient fee");
+        assert!(res_full.unwrap_err().contains("Mempool is full by bytes"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_build_proposal_byte_limit_and_wire_headroom() {
+        let temp_dir = std::env::temp_dir().join(format!("vera_test_proposal_{}", rand::random::<u64>()));
+        let (genesis_cfg, val_key) = GenesisConfig::default_testnet();
+        let mut node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key.clone())).unwrap();
+
+        let val_addr = crate::chain_hash::hash256(&val_key.verifying_key().to_bytes());
+        node.csmt.insert(val_addr, Account::new(100_000_000_000_000_000_000).to_bytes());
+
+        // Construct a native computation graph (~100 KiB)
+        let mut g = vera_engine_v2::ComputationGraph::new();
+        let ins: Vec<_> = (0..4).map(|i| g.add_input(i)).collect();
+        let (mut a, mut b, mut d, m) = (ins[0], ins[1], ins[2], ins[3]);
+        for i in 0..1000 {
+            let r = g.add_fused_arx(a, b, d, m, [16, 12, 8, 7][i % 4]);
+            a = b;
+            b = d;
+            d = r;
+        }
+        g.set_output(d);
+        let graph_json = g.to_json().into_bytes();
+
+        // Create 30 transactions of ~100 KiB program each (total ~3 MiB)
+        for i in 0..30 {
+            let tx = Transaction::new(
+                &node.chain_id,
+                &val_key,
+                i as u64,
+                Some([0x33u8; 32]),
+                100,
+                2_500_000,
+                1,
+                graph_json.clone(),
+            );
+            node.mempool.push(tx);
+        }
+
+        let proposal = node.build_proposal().await.unwrap();
+        let total_tx_bytes: usize = proposal.transactions.iter().map(|t| t.to_bytes().len()).sum();
+        assert!(
+            total_tx_bytes <= MAX_BLOCK_TX_BYTES,
+            "Total tx bytes in proposal ({} bytes) must not exceed MAX_BLOCK_TX_BYTES ({} bytes)",
+            total_tx_bytes,
+            MAX_BLOCK_TX_BYTES
+        );
+
+        // Verify that the proposal serialized into BlockProposal fits well within MAX_P2P_FRAME_SIZE (4 MiB)
+        let proposal_payload = crate::p2p::P2PPayload::BlockProposal(proposal.clone());
+        let serialized_frame = serde_json::to_vec(&proposal_payload).unwrap();
+        let wire_frame_size = 1 + serialized_frame.len();
+        assert!(
+            wire_frame_size <= MAX_BLOCK_WIRE_BYTES,
+            "BlockProposal complete wire frame size ({} bytes) must be <= MAX_BLOCK_WIRE_BYTES ({} bytes)",
+            wire_frame_size,
+            MAX_BLOCK_WIRE_BYTES
+        );
+
+        // Verify validate_proposal logs warning but returns Ok(())
+        let val_res = node.validate_proposal(&proposal).await;
+        assert!(val_res.is_ok(), "validate_proposal must accept the block proposal without error");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_build_proposal_drops_oversized_log_tx() {
+        let temp_dir = std::env::temp_dir().join(format!("vera_test_logs_{}", rand::random::<u64>()));
+        let (genesis_cfg, val_key) = GenesisConfig::default_testnet();
+        let mut node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key.clone())).unwrap();
+
+        let val_addr = crate::chain_hash::hash256(&val_key.verifying_key().to_bytes());
+        node.csmt.insert(val_addr, Account::new(100_000_000_000_000_000_000).to_bytes());
+
+        // Create a normal transfer tx
+        let tx1 = Transaction::new(
+            &node.chain_id,
+            &val_key,
+            0,
+            Some([0x11u8; 32]),
+            100,
+            21_000,
+            1,
+            vec![],
+        );
+        node.mempool.push(tx1);
+
+        let proposal = node.build_proposal().await.unwrap();
+        assert_eq!(proposal.transactions.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sync_response_byte_truncation() {
+        use rand::rngs::OsRng;
+        let mut blocks = Vec::new();
+        for h in 1..=10 {
+            let mut b = Block::new(
+                BlockHeader {
+                    height: h,
+                    prev_hash: [0u8; 32],
+                    timestamp: 1000 + h,
+                    state_root: [0u8; 32],
+                    tx_root: [0u8; 32],
+                    receipts_root: [0u8; 32],
+                    proposer: [0u8; 32],
+                    last_commit_hash: [0u8; 32],
+                },
+                Vec::new(),
+                Vec::new(),
+            );
+            let dummy_key = SigningKey::generate(&mut OsRng);
+            b.transactions.push(Transaction::new(
+                "vera-testnet-1",
+                &dummy_key,
+                0,
+                None,
+                0,
+                1_000_000,
+                1,
+                vec![0x55; 100 * 1024],
+            ));
+            blocks.push(b);
+        }
+
+        let mut res = crate::p2p::SyncResponse::new(blocks);
+        assert_eq!(res.blocks.len(), 10);
+
+        // Truncate to 300 KB limit: should keep at least 1 block and truncate others
+        res.truncate_to_byte_limit(300 * 1024);
+        assert!(res.blocks.len() >= 1 && res.blocks.len() < 10);
+        let frame_len = 1 + serde_json::to_vec(&crate::p2p::P2PPayload::SyncResponse(res.clone())).unwrap().len();
+        assert!(frame_len <= 300 * 1024 || res.blocks.len() == 1, "Truncated frame size must respect wire limit");
+    }
+
+    #[test]
+    fn test_single_block_exceeding_p2p_frame_handling() {
+        use rand::rngs::OsRng;
+        let mut b = Block::new(
+            BlockHeader {
+                height: 99,
+                prev_hash: [0u8; 32],
+                timestamp: 2000,
+                state_root: [0u8; 32],
+                tx_root: [0u8; 32],
+                receipts_root: [0u8; 32],
+                proposer: [0u8; 32],
+                last_commit_hash: [0u8; 32],
+            },
+            Vec::new(),
+            Vec::new(),
+        );
+        let dummy_key = SigningKey::generate(&mut OsRng);
+        b.transactions.push(Transaction::new(
+            "vera-testnet-1",
+            &dummy_key,
+            0,
+            None,
+            0,
+            1_000_000,
+            1,
+            vec![0xAA; 4 * 1024 * 1024], // 4 MB payload
+        ));
+        let single_frame_len = 1 + serde_json::to_vec(&crate::p2p::P2PPayload::SyncResponse(crate::p2p::SyncResponse { blocks: vec![b.clone()] }))
+            .map(|v| v.len())
+            .unwrap_or(0);
+        assert!(single_frame_len > crate::p2p::wire::MAX_P2P_FRAME_SIZE, "Oversized single block must exceed MAX_P2P_FRAME_SIZE");
+    }
+
 }
 

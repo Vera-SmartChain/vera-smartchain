@@ -256,3 +256,22 @@ pub fn parse_validator_status_from_json(val_json: &serde_json::Value, address: &
         missed_blocks,
     }
 }
+
+/// Compares two semver version strings like "v0.2.4-testnet" and "v0.2.4.1-testnet".
+/// Returns true if `remote` is strictly newer than `current`.
+pub fn is_version_newer(remote: &str, current: &str) -> bool {
+    let parse_semver = |s: &str| -> Option<Vec<u64>> {
+        let clean = s.trim().trim_start_matches('v').split('-').next()?;
+        let parts: Vec<&str> = clean.split('.').collect();
+        if parts.is_empty() {
+            return None;
+        }
+        parts.iter().map(|p| p.parse().ok()).collect()
+    };
+    if let (Some(r), Some(c)) = (parse_semver(remote), parse_semver(current)) {
+        r > c
+    } else {
+        false
+    }
+}
+

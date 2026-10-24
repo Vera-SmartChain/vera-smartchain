@@ -416,15 +416,15 @@ impl RpcHandler {
         let result = match req.method.as_str() {
             // ==================== EVM / METAMASK COMPATIBILITY ====================
             "eth_chainId" => {
-                let n = node.lock().await;
+                let n = node.read().await;
                 Ok(serde_json::to_value(format!("0x{:x}", n.evm_chain_id)).unwrap())
             }
             "net_version" => {
-                let n = node.lock().await;
+                let n = node.read().await;
                 Ok(serde_json::to_value(n.evm_chain_id.to_string()).unwrap())
             }
             "eth_blockNumber" => {
-                let n = node.lock().await;
+                let n = node.read().await;
                 Ok(serde_json::to_value(format!("0x{:x}", n.height)).unwrap())
             }
             "eth_getBalance" => {
@@ -434,7 +434,7 @@ impl RpcHandler {
                     .unwrap_or("");
                 match address_from_hex(addr_str) {
                     Ok(addr) => {
-                        let n = node.lock().await;
+                        let n = node.read().await;
                         let mut bal = match n.csmt.get(&addr) {
                             Some(bytes) => match Account::from_bytes(bytes) {
                                 Ok(acc) => Some(acc.balance),
@@ -444,12 +444,13 @@ impl RpcHandler {
                         };
 
                         if bal.is_none() && addr[..12] == [0u8; 12] {
-                            for (k, v) in n.csmt.values() {
-                                if k[12..32] == addr[12..32] {
-                                    if let Ok(acc) = Account::from_bytes(v) {
-                                        bal = Some(acc.balance);
-                                        break;
-                                    }
+                            // Indexed lookup by the last 20 bytes (was a scan of every account).
+                            let mut suffix = [0u8; 20];
+                            suffix.copy_from_slice(&addr[12..32]);
+                            for k in n.csmt.keys_with_suffix20(&suffix) {
+                                if let Some(Ok(acc)) = n.csmt.get(&k).map(|v| Account::from_bytes(v)) {
+                                    bal = Some(acc.balance);
+                                    break;
                                 }
                             }
                         }
@@ -483,7 +484,7 @@ impl RpcHandler {
 
                 match address_from_hex(addr_str) {
                     Ok(addr) => {
-                        let n = node.lock().await;
+                        let n = node.read().await;
                         let mut base_nonce = match n.csmt.get(&addr) {
                             Some(bytes) => match Account::from_bytes(bytes) {
                                 Ok(acc) => Some(acc.nonce),
@@ -493,12 +494,12 @@ impl RpcHandler {
                         };
 
                         if base_nonce.is_none() && addr[..12] == [0u8; 12] {
-                            for (k, v) in n.csmt.values() {
-                                if k[12..32] == addr[12..32] {
-                                    if let Ok(acc) = Account::from_bytes(v) {
-                                        base_nonce = Some(acc.nonce);
-                                        break;
-                                    }
+                            let mut suffix = [0u8; 20];
+                            suffix.copy_from_slice(&addr[12..32]);
+                            for k in n.csmt.keys_with_suffix20(&suffix) {
+                                if let Some(Ok(acc)) = n.csmt.get(&k).map(|v| Account::from_bytes(v)) {
+                                    base_nonce = Some(acc.nonce);
+                                    break;
                                 }
                             }
                         }
@@ -521,7 +522,7 @@ impl RpcHandler {
                     .unwrap_or("");
                 match address_from_hex(addr_str) {
                     Ok(addr) => {
-                        let n = node.lock().await;
+                        let n = node.read().await;
                         match n.csmt.get(&addr) {
                             Some(bytes) => match Account::from_bytes(bytes) {
                                 Ok(acc) => {
@@ -556,7 +557,7 @@ impl RpcHandler {
                         if slot_bytes.len() <= 32 {
                             slot[32 - slot_bytes.len()..].copy_from_slice(&slot_bytes);
                         }
-                        let n = node.lock().await;
+                        let n = node.read().await;
                         let s_key = crate::evm::CsmtDatabase::storage_slot_key(&addr, &slot);
                         if let Some(val) = n.csmt.get(&s_key) {
                             Ok(serde_json::to_value(format!("0x{}", hex::encode(val))).unwrap())
@@ -588,7 +589,7 @@ impl RpcHandler {
                 let gas_limit = u64::from_str_radix(gas_str.strip_prefix("0x").unwrap_or(gas_str), 16).unwrap_or(1_000_000);
 
                 let is_deploy = to.is_none();
-                let n = node.lock().await;
+                let n = node.read().await;
                 let mut sim_csmt = n.csmt.clone();
 
                 let target_has_code = if let Some(target_addr) = to {
@@ -679,7 +680,7 @@ impl RpcHandler {
                 Ok(serde_json::to_value(true).unwrap())
             }
             "net_peerCount" => {
-                let n = node.lock().await;
+                let n = node.read().await;
                 Ok(serde_json::to_value(format!("0x{:x}", n.peer_count)).unwrap())
             }
             "eth_syncing" => {
@@ -705,7 +706,7 @@ impl RpcHandler {
                     .min(1024)
                     .max(1);
 
-                let n = node.lock().await;
+                let n = node.read().await;
                 let latest_h = n.height;
                 let newest_h = params
                     .and_then(|arr| arr.get(1))
@@ -749,7 +750,7 @@ impl RpcHandler {
                 let value = u128::from_str_radix(value_str.strip_prefix("0x").unwrap_or(value_str), 16).unwrap_or(0);
                 let gas_limit = u64::from_str_radix(gas_str.strip_prefix("0x").unwrap_or(gas_str), 16).unwrap_or(1_000_000);
 
-                let n = node.lock().await;
+                let n = node.read().await;
                 let mut sim_csmt = n.csmt.clone();
                 let height = n.height;
                 let evm_chain_id = n.evm_chain_id;
@@ -808,7 +809,7 @@ impl RpcHandler {
                 Ok(serde_json::to_value("0x3b9aca00").unwrap())
             }
             "eth_getBlockByNumber" | "eth_getBlockByHash" => {
-                let n = node.lock().await;
+                let n = node.read().await;
                 let is_by_hash = req.method == "eth_getBlockByHash";
                 let param0 = req.params.as_array()
                     .and_then(|arr| arr.get(0))
@@ -942,7 +943,7 @@ impl RpcHandler {
                     .and_then(|arr| arr.get(0))
                     .and_then(|v| v.as_str())
                     .unwrap_or("0x0");
-                let n = node.lock().await;
+                let n = node.read().await;
 
                 let clean = tx_hash_str.trim().trim_start_matches("0x");
                 let mut found_tx_val = serde_json::Value::Null;
@@ -1007,7 +1008,7 @@ impl RpcHandler {
 
             // ==================== AUTHORITATIVE NETWORK STATE ====================
             "vera_status" => {
-                let n = node.lock().await;
+                let n = node.read().await;
                 let validators_info: Vec<serde_json::Value> = n.validator_set.validators.iter().enumerate().map(|(idx, v)| {
                     serde_json::json!({
                         "rank": idx + 1,
@@ -1054,7 +1055,7 @@ impl RpcHandler {
                     let tx_hash = format!("0x{}", hex::encode(hash_bytes));
 
                     let (expected_chain_id, node_chain_id) = {
-                        let n = node.lock().await;
+                        let n = node.read().await;
                         (n.evm_chain_id, n.chain_id.clone())
                     };
 
@@ -1062,7 +1063,7 @@ impl RpcHandler {
                     let recovered = match parse_and_recover_evm_tx(&raw_bytes, expected_chain_id) {
                         Ok(tx) => tx,
                         Err(e) => {
-                            let mut n = node.lock().await;
+                            let mut n = node.write().await;
                             let now_ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -1105,7 +1106,7 @@ impl RpcHandler {
                         raw_evm: Some(raw_bytes),
                     };
 
-                    let mut n = node.lock().await;
+                    let mut n = node.write().await;
                     match n.submit_transaction(tx) {
                         Ok(_) => Ok(serde_json::to_value(tx_hash).unwrap()),
                         Err(e) => Err(e),
@@ -1119,7 +1120,7 @@ impl RpcHandler {
                     .and_then(|arr| arr.get(0))
                     .and_then(|v| v.as_str())
                     .unwrap_or("0x0");
-                let n = node.lock().await;
+                let n = node.read().await;
 
                 let clean = tx_hash_str.trim().trim_start_matches("0x");
                 let mut return_rcpt = serde_json::Value::Null;
@@ -1198,7 +1199,7 @@ impl RpcHandler {
                     .and_then(|v| v.as_object());
 
                 let (latest_height, storage) = {
-                    let n = node.lock().await;
+                    let n = node.read().await;
                     (n.height, n.storage.clone())
                 };
 
@@ -1393,7 +1394,7 @@ impl RpcHandler {
 
             // ==================== VERA NATIVE METHODS ====================
             "vera_getValidators" => {
-                let n = node.lock().await;
+                let n = node.read().await;
                 let active = n.validator_set.active_validators();
                 let active_json: Vec<_> = active.iter().map(|v| {
                     serde_json::json!({
@@ -1447,7 +1448,7 @@ impl RpcHandler {
                     .and_then(|arr| arr.get(0))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(20) as usize;
-                let n = node.lock().await;
+                let n = node.read().await;
                 let txs: Vec<TxRecord> = n.recent_transactions.iter().take(limit).cloned().collect();
                 Ok(serde_json::to_value(txs).unwrap())
             }
@@ -1457,7 +1458,7 @@ impl RpcHandler {
                     .and_then(|arr| arr.get(0))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(10) as usize;
-                let n = node.lock().await;
+                let n = node.read().await;
                 let now_ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs())
@@ -1522,7 +1523,7 @@ impl RpcHandler {
             }
 
             "vera_blockNumber" => {
-                let n = node.lock().await;
+                let n = node.read().await;
                 Ok(serde_json::to_value(n.height).unwrap())
             }
             "vera_getBlockByNumber" => {
@@ -1530,7 +1531,7 @@ impl RpcHandler {
                     .and_then(|arr| arr.get(0))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let n = node.lock().await;
+                let n = node.read().await;
                 match n.storage.load_block(height) {
                     Ok(Some(b)) => Ok(serde_json::to_value(b).unwrap()),
                     Ok(None) => Ok(Value::Null),
@@ -1544,7 +1545,7 @@ impl RpcHandler {
                     .unwrap_or("");
                 match address_from_hex(addr_str) {
                     Ok(addr) => {
-                        let n = node.lock().await;
+                        let n = node.read().await;
                         match n.csmt.get(&addr) {
                             Some(bytes) => match Account::from_bytes(bytes) {
                                 Ok(acc) => Ok(serde_json::json!({
@@ -1573,7 +1574,7 @@ impl RpcHandler {
                     .unwrap_or("");
                 match address_from_hex(addr_str) {
                     Ok(addr) => {
-                        let n = node.lock().await;
+                        let n = node.read().await;
                         // Try inclusion first, fallback to non-existence
                         match n.csmt.proof_of_inclusion(&addr) {
                             Ok(proof) => Ok(serde_json::to_value(proof).unwrap()),
@@ -1595,14 +1596,14 @@ impl RpcHandler {
                 match hex::decode(clean) {
                     Ok(bytes) => match Transaction::from_bytes(&bytes) {
                         Ok(tx) => {
-                            let mut n = node.lock().await;
+                            let mut n = node.write().await;
                             match n.submit_transaction(tx) {
                                 Ok(h) => Ok(serde_json::to_value(format!("0x{}", hex::encode(h))).unwrap()),
                                 Err(e) => Err(e),
                             }
                         }
                         Err(e) => {
-                            let mut n = node.lock().await;
+                            let mut n = node.write().await;
                             let now_ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -1624,7 +1625,7 @@ impl RpcHandler {
                         }
                     },
                     Err(e) => {
-                        let mut n = node.lock().await;
+                        let mut n = node.write().await;
                         let now_ts = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
@@ -1647,7 +1648,7 @@ impl RpcHandler {
                 }
             }
             "vera_getNodeAttestation" | "vera_verifyNodeIntegrity" => {
-                let n = node.lock().await;
+                let n = node.read().await;
 
                 let bin_hex = format!("0x{}", hex::encode(n.binary_hash));
                 let node_addr = format!("0x{}", hex::encode(n.address));
@@ -1671,7 +1672,7 @@ impl RpcHandler {
                     .and_then(|arr| arr.get(0))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(20) as usize;
-                let n = node.lock().await;
+                let n = node.read().await;
                 let incidents: Vec<SecurityIncident> = n.security_incidents.iter().take(limit).cloned().collect();
                 Ok(serde_json::to_value(incidents).unwrap())
             }
@@ -1717,7 +1718,7 @@ impl RpcHandler {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use tokio::sync::Mutex;
+
     use crate::node::FullNode;
     use crate::genesis::GenesisConfig;
     use crate::account::Account;
@@ -1727,14 +1728,14 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("vera_est_gas_{}", rand::random::<u64>()));
         let (genesis_cfg, val_key) = GenesisConfig::default_testnet();
         let node = FullNode::load_or_init(&temp_dir, &genesis_cfg, Some(val_key)).unwrap();
-        let shared_node = Arc::new(Mutex::new(node));
+        let shared_node = Arc::new(tokio::sync::RwLock::new(node));
 
         let contract_addr = [0x42u8; 32];
         let eoa_addr = [0x55u8; 32];
         let caller_addr = [0x11u8; 32];
 
         {
-            let mut n = shared_node.lock().await;
+            let mut n = shared_node.write().await;
             // Create a contract with code
             let mut contract_acc = Account::new(1_000_000_000);
             contract_acc.code_hash = [1u8; 32]; // Mark as having code

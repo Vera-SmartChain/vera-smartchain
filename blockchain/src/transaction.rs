@@ -107,6 +107,21 @@ impl Transaction {
             if recovered.value != self.amount {
                 return Err("Value differs from ECDSA signature".to_string());
             }
+            // Every field the state transition reads must be bound to the ECDSA-signed payload;
+            // otherwise a relayer or proposer could rewrite to/calldata/gas around a valid signature.
+            let expected_to = if recovered.is_contract_creation { None } else { Some(recovered.to) };
+            if self.to != expected_to {
+                return Err("Recipient differs from ECDSA signature".to_string());
+            }
+            if recovered.gas_limit != self.gas_limit || recovered.gas_price != self.gas_price {
+                return Err("Gas parameters differ from ECDSA signature".to_string());
+            }
+            if recovered.data != self.program {
+                return Err("Calldata differs from ECDSA signature".to_string());
+            }
+            if self.public_key != [0u8; 32] || self.signature != [0u8; 64] {
+                return Err("EVM transaction must not carry native public_key/signature fields".to_string());
+            }
             return Ok(());
         }
 
