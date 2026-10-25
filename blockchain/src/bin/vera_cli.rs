@@ -12,7 +12,7 @@ use vera_blockchain::validator_application::{
 };
 use vera_engine_v2::{canonical_encode, normalize, ComputationGraph};
 
-const CURRENT_VERSION: &str = "0.2.8.1-testnet";
+const CURRENT_VERSION: &str = vera_blockchain::NODE_VERSION;
 
 async fn check_new_version_notice() {
     let cache_dir = if Path::new("/var/lib/vera").is_dir() {
@@ -1156,7 +1156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn print_usage() {
-    println!("VERA SmartChain Node CLI (v0.2.8.1-testnet)");
+    println!("VERA SmartChain Node CLI (v{})", CURRENT_VERSION);
     println!("Usage: vera_cli <command> [options]");
     println!();
     println!("Commands:");

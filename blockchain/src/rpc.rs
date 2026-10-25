@@ -674,7 +674,7 @@ impl RpcHandler {
                 }
             }
             "web3_clientVersion" => {
-                Ok(serde_json::to_value("VERA-SmartChain/v1.0.0 (BFT-PoS)").unwrap())
+                Ok(serde_json::to_value(format!("VERA-SmartChain/v{}", crate::NODE_VERSION)).unwrap())
             }
             "net_listening" => {
                 Ok(serde_json::to_value(true).unwrap())

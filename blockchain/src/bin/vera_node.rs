@@ -314,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("VERA SmartChain Node v1.0.0 (BFT-PoS & EVM compatible)");
+        println!("VERA SmartChain Node v{} (Tendermint BFT, EVM compatible)", vera_blockchain::NODE_VERSION);
         println!("Usage: vera_node [OPTIONS]");
         println!();
         println!("Options:");
@@ -406,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("=======================================================");
-    println!("             VERA CHAIN FULL NODE v1.0.0               ");
+    println!("        VERA CHAIN FULL NODE v{:<22}", vera_blockchain::NODE_VERSION);
     println!("=======================================================");
     println!("Data Directory: {}", data_dir);
     println!("Genesis Config: {}", genesis_path);
