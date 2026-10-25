@@ -2,11 +2,11 @@
 
 The official open-source core repository for **Vera SmartChain**.
 
-Vera SmartChain is an enterprise-grade Layer-1 blockchain engineered in Rust. Consensus and state verification use the industry-standard BLAKE3 hash function for high throughput and provable security. Key architectural components include:
+Vera SmartChain is a Layer-1 blockchain engineered in Rust. Consensus and state commitments use the BLAKE3 hash function. Key architectural components include:
 - **Tendermint/PBFT-style Proof-of-Stake Consensus:** Deterministic BFT commit (blocks produced on transaction intake), dynamic validator staking, and unbonding.
-- **Compact Sparse Merkle Tree (CSMT):** High-throughput authenticated key-value state commitment with cryptographic non-existence proofs.
-- **Native EVM Execution:** Full Ethereum Virtual Machine compatibility powered by [`revm`](https://github.com/bluealloy/revm).
-- **VERA Engine v2:** Execution engine featuring canonical SSA computation graphs, isomorphic normalizers, and high-speed ARX-64 hashing.
+- **Compact Sparse Merkle Tree (CSMT):** Authenticated key-value state commitment with cryptographic non-existence proofs.
+- **Native EVM Execution:** Ethereum Virtual Machine (Cancun rules) powered by [`revm`](https://github.com/bluealloy/revm); see the documentation for differences (e.g. BLOCKHASH returns 0).
+- **VERA Engine v2:** Execution engine featuring canonical SSA computation graphs, isomorphic normalizers, and an experimental ARX-64 research hash (not used in consensus).
 
 ---
 

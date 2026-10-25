@@ -13,7 +13,7 @@
 | **Decimal Precision** | 18 decimals (1 VERA = 10¹⁸ wei) |
 | **Total Hard Cap** | **100,000,000 VERA** (100 Million) — *planned for mainnet, may change* |
 | **Economic Model** | Fee split 70/15/15 (implemented on the testnet) |
-| **Consensus Engine** | Tendermint BFT Proof-of-Stake with 2/3 + 1 supermajority commitment |
+| **Consensus Engine** | Tendermint BFT Proof-of-Stake with commit by validators holding more than 2/3 of the stake |
 | **Signature Scheme** | Ed25519 (256-bit Edwards Curve) |
 | **State Hashing** | BLAKE3 (256-bit cryptographic tree hashing) |
 | **Finality** | Immediate deterministic BFT finality (zero probabilistic forks; measured median finality 554 ms) |
@@ -40,8 +40,8 @@
 Every transaction fee and smart contract gas cost processed on the network is split deterministically:
 
 1. **70% to Block Proposer:** Directly rewards the active proposer node securing the consensus.
-2. **15% Stability Pool:** Sent to the stability reserve (`0x00000000000000000000000000000000000057ab`).
-3. **15% Protocol Burn:** Sent to the burn address `0x000000000000000000000000000000000000dead`, which no one controls. There is no block reward or inflation.
+2. **15% Stability Pool:** Sent to the stability reserve (`0x0000000000000000000000000000000000000000000000000000000000005afe`).
+3. **15% Protocol Burn:** Sent to the burn address `0x000000000000000000000000000000000000000000000000000000000000dead`, which no one controls. There is no block reward or inflation.
 
 ---
 
