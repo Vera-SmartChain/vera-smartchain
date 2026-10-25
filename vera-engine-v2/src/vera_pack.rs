@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn test_vera_pack_compressible() {
-        let original = b"VERACHAIN SOVEREIGN PROTOCOL 0-RTT LAYER 0 OP_VERA_PACK TEST "
+        let original = b"VERACHAIN PROTOCOL PAYLOAD 0-RTT LAYER 0 OP_VERA_PACK TEST "
             .repeat(500); // ~30 KB
         let (packed, is_compressed) = vera_pack(&original);
 

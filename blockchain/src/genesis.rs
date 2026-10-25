@@ -47,6 +47,10 @@ pub struct GenesisConfig {
     /// from `builtin_tendermint_activation` instead, so their genesis file never changes.
     #[serde(default)]
     pub tendermint_activation_height: Option<u64>,
+    /// First height executed under execution rules v2 (devnets). Public networks take it
+    /// from `builtin_exec_v2_activation` instead.
+    #[serde(default)]
+    pub exec_v2_activation_height: Option<u64>,
 }
 
 /// Tendermint activation height of public networks, fixed per release (a coordinated,
@@ -55,6 +59,17 @@ pub fn builtin_tendermint_activation(chain_id: &str) -> Option<u64> {
     match chain_id {
         // v0.2.6 (21/Out/2026): announced at #102, every validator upgrades before #152.
         "vera-testnet-1" => Some(152),
+        _ => None,
+    }
+}
+
+/// Activation height of execution rules v2 on public networks (consensus-breaking):
+/// stability-pool and burn fee shares credited once per block, receipts without a
+/// per-transaction state root, receipt hash v2 covering the logs. None = not scheduled yet.
+pub fn builtin_exec_v2_activation(chain_id: &str) -> Option<u64> {
+    match chain_id {
+        // v0.2.9 (25/Oct/2026): chain idle at #734; every validator upgrades before #760.
+        "vera-testnet-1" => Some(760),
         _ => None,
     }
 }
@@ -247,6 +262,7 @@ impl GenesisConfig {
             governance_address: Some(address_to_hex(&user_addr)),
             validator_allowlist: vec![address_to_hex(&val_addr)],
             tendermint_activation_height: None,
+            exec_v2_activation_height: None,
         };
 
         (cfg, val_signing_key)
@@ -312,6 +328,7 @@ impl GenesisConfig {
             governance_address: Some("000000000000000000000000000000000000000000000000000000000000ec05".to_string()),
             validator_allowlist: vec![],
             tendermint_activation_height: None,
+            exec_v2_activation_height: None,
         })
     }
 }

@@ -162,6 +162,28 @@ impl ExecutionReceipt {
         hasher.finalize()
     }
 
+    /// Receipt hash from execution rules v2: domain-separated, no per-transaction state
+    /// root, and it commits to the logs (`hash` leaves them out).
+    pub fn hash_v2(&self) -> [u8; 32] {
+        let mut hasher = crate::chain_hash::ChainHasher::new();
+        hasher.update(b"VERA_RECEIPT_V2");
+        hasher.update(&self.tx_hash);
+        hasher.update(&[if self.success { 1 } else { 0 }]);
+        hasher.update(&self.gas_used.to_le_bytes());
+        hasher.update(&self.trace_root);
+        hasher.update(&(self.logs.len() as u64).to_le_bytes());
+        for log in &self.logs {
+            hasher.update(&log.address);
+            hasher.update(&(log.topics.len() as u64).to_le_bytes());
+            for topic in &log.topics {
+                hasher.update(topic);
+            }
+            hasher.update(&(log.data.len() as u64).to_le_bytes());
+            hasher.update(&log.data);
+        }
+        hasher.finalize()
+    }
+
     pub fn logs_bloom(&self) -> String {
         let bloom = compute_logs_bloom(&self.logs);
         format!("0x{}", hex::encode(bloom))

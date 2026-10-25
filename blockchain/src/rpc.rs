@@ -1038,7 +1038,7 @@ impl RpcHandler {
 
             // ==================== TRANSACTIONS & TRANSFERS ====================
             "eth_sendTransaction" => {
-                Err("eth_sendTransaction not supported: The sovereign node operates in non-custodial mode. Sign the transaction locally in your wallet (MetaMask / VeraWallet) and broadcast via eth_sendRawTransaction.".to_string())
+                Err("eth_sendTransaction not supported: This node is non-custodial and holds no user keys. Sign the transaction locally in your wallet (MetaMask / VeraWallet) and broadcast via eth_sendRawTransaction.".to_string())
             }
 
             "eth_sendRawTransaction" => {

@@ -108,6 +108,37 @@ pub const STABILITY_POOL_ADDRESS: Address = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x5a, 0xfe,
 ];
 
+/// Stability-pool and burn fee shares of a block under execution rules v2, credited once
+/// after its last transaction. Both addresses share a ~240-bit key prefix in the CSMT, so a
+/// per-transaction insert rehashes ~240 levels each time: ~80% of block execution in v1.
+/// Inside the block, those two balances read as they were before the block.
+#[derive(Debug, Default)]
+pub struct FeeBatch {
+    pub stability: u128,
+    pub burn: u128,
+}
+
+impl FeeBatch {
+    pub fn flush(self, csmt: &mut CSMT) -> Result<(), String> {
+        for (addr, amount) in [(STABILITY_POOL_ADDRESS, self.stability), (BURN_ADDRESS, self.burn)] {
+            if amount == 0 {
+                continue;
+            }
+            let mut account = match csmt.get(&addr) {
+                Some(bytes) => Account::from_bytes(bytes)?,
+                None => Account::new(0),
+            };
+            account.balance = account.balance.saturating_add(amount);
+            csmt.insert(addr, account.to_bytes());
+        }
+        Ok(())
+    }
+}
+
+fn exec_v2_active(activation: Option<u64>, height: u64) -> bool {
+    activation.map_or(false, |a| height >= a)
+}
+
 pub struct StateTransitionEngine;
 
 impl StateTransitionEngine {
@@ -163,6 +194,36 @@ impl StateTransitionEngine {
         block_height: u64,
         block_timestamp: u64,
         evm_chain_id: u64,
+    ) -> Result<ExecutionReceipt, String> {
+        Self::execute_transaction_in_block_sync(csmt, tx, proposer, block_height, block_timestamp, evm_chain_id, None)
+    }
+
+    /// Mempool simulation of one transaction (admission and pruning). It only decides
+    /// whether the sender's transaction applies, so the stability-pool and burn fee shares
+    /// are dropped instead of credited: those two CSMT updates were about half of the
+    /// admission cost. Local policy only; block execution is unchanged.
+    pub fn simulate_transaction_sync(
+        csmt: &mut CSMT,
+        tx: &Transaction,
+        proposer: Address,
+        block_height: u64,
+        block_timestamp: u64,
+        evm_chain_id: u64,
+    ) -> Result<ExecutionReceipt, String> {
+        let mut dropped = FeeBatch::default();
+        Self::execute_transaction_in_block_sync(csmt, tx, proposer, block_height, block_timestamp, evm_chain_id, Some(&mut dropped))
+    }
+
+    /// Executes one transaction of a block. `fee_batch` = Some under execution rules v2:
+    /// the stability-pool and burn shares go to the batch, and the receipt carries no state root.
+    pub fn execute_transaction_in_block_sync(
+        csmt: &mut CSMT,
+        tx: &Transaction,
+        proposer: Address,
+        block_height: u64,
+        block_timestamp: u64,
+        evm_chain_id: u64,
+        mut fee_batch: Option<&mut FeeBatch>,
     ) -> Result<ExecutionReceipt, String> {
         // 1. Cryptographic Signature Verification and Cross-Chain Shielding
         verify_signature_cached(tx)?;
@@ -455,24 +516,30 @@ impl StateTransitionEngine {
                 csmt.insert(proposer, prop_account.to_bytes());
             }
 
-            // 8.2 Credit to Stability Pool
-            if stability_fee > 0 {
-                let mut stab_account = match csmt.get(&STABILITY_POOL_ADDRESS) {
-                    Some(bytes) => Account::from_bytes(bytes)?,
-                    None => Account::new(0),
-                };
-                stab_account.balance = stab_account.balance.saturating_add(stability_fee);
-                csmt.insert(STABILITY_POOL_ADDRESS, stab_account.to_bytes());
-            }
+            // 8.2 / 8.3 Execution rules v2: stability and burn shares credited once per block
+            if let Some(batch) = fee_batch.as_deref_mut() {
+                batch.stability = batch.stability.saturating_add(stability_fee);
+                batch.burn = batch.burn.saturating_add(burn_fee);
+            } else {
+                // 8.2 Credit to Stability Pool
+                if stability_fee > 0 {
+                    let mut stab_account = match csmt.get(&STABILITY_POOL_ADDRESS) {
+                        Some(bytes) => Account::from_bytes(bytes)?,
+                        None => Account::new(0),
+                    };
+                    stab_account.balance = stab_account.balance.saturating_add(stability_fee);
+                    csmt.insert(STABILITY_POOL_ADDRESS, stab_account.to_bytes());
+                }
 
-            // 8.3 Credit to Burn Address
-            if burn_fee > 0 {
-                let mut burn_account = match csmt.get(&BURN_ADDRESS) {
-                    Some(bytes) => Account::from_bytes(bytes)?,
-                    None => Account::new(0),
-                };
-                burn_account.balance = burn_account.balance.saturating_add(burn_fee);
-                csmt.insert(BURN_ADDRESS, burn_account.to_bytes());
+                // 8.3 Credit to Burn Address
+                if burn_fee > 0 {
+                    let mut burn_account = match csmt.get(&BURN_ADDRESS) {
+                        Some(bytes) => Account::from_bytes(bytes)?,
+                        None => Account::new(0),
+                    };
+                    burn_account.balance = burn_account.balance.saturating_add(burn_fee);
+                    csmt.insert(BURN_ADDRESS, burn_account.to_bytes());
+                }
             }
         }
 
@@ -480,7 +547,8 @@ impl StateTransitionEngine {
             tx_hash: tx.tx_hash(),
             success: execution_success,
             gas_used,
-            state_root: csmt.root(),
+            // v2: the state root is committed once per block (block header), not per tx
+            state_root: if fee_batch.is_some() { [0u8; 32] } else { csmt.root() },
             trace_root,
             logs: if tx.to.is_none() && tx.program.is_empty() { Vec::new() } else { evm_logs },
         };
@@ -493,6 +561,7 @@ impl StateTransitionEngine {
         csmt: &mut CSMT,
         block: &mut Block,
         evm_chain_id: u64,
+        exec_v2_activation: Option<u64>,
     ) -> Result<[u8; 32], String> {
         // 1. Liveness audit and slashing from block.last_commit (for blocks > 1)
         if block.header.height > 1 {
@@ -554,16 +623,20 @@ impl StateTransitionEngine {
         let mut receipts = Vec::with_capacity(block.transactions.len());
         let mut applied = Vec::with_capacity(block.transactions.len());
 
+        let v2 = exec_v2_active(exec_v2_activation, block.header.height);
+        let mut fee_batch = FeeBatch::default();
         for tx in &block.transactions {
-            match Self::execute_transaction_with_context(csmt, tx, block.header.proposer, block.header.height, block.header.timestamp, evm_chain_id).await {
+            let batch = if v2 { Some(&mut fee_batch) } else { None };
+            match Self::execute_transaction_in_block_sync(csmt, tx, block.header.proposer, block.header.height, block.header.timestamp, evm_chain_id, batch) {
                 Ok(receipt) => { receipts.push(receipt); applied.push(tx.clone()); }
                 Err(_) => { /* unapplicable tx: omitted from this block */ }
             }
         }
+        fee_batch.flush(csmt)?;
 
         block.transactions = applied;
         block.header.tx_root = Block::compute_tx_root(&block.transactions);
-        block.header.receipts_root = Block::compute_receipts_root(&receipts);
+        block.header.receipts_root = if v2 { Block::compute_receipts_root_v2(&receipts) } else { Block::compute_receipts_root(&receipts) };
         block.header.last_commit_hash = Block::compute_commits_root(&block.last_commit);
         block.header.state_root = csmt.root();
         block.receipts = receipts;
@@ -576,8 +649,9 @@ impl StateTransitionEngine {
         csmt: &mut CSMT,
         block: &Block,
         evm_chain_id: u64,
+        exec_v2_activation: Option<u64>,
     ) -> Result<([u8; 32], [u8; 32], [u8; 32]), String> {
-        Self::validate_block_strict_with_receipts(csmt, block, evm_chain_id).await.map(|(roots, _)| roots)
+        Self::validate_block_strict_with_receipts(csmt, block, evm_chain_id, exec_v2_activation).await.map(|(roots, _)| roots)
     }
 
     /// `validate_block_strict` that also returns the receipts it computed (a compact
@@ -586,6 +660,7 @@ impl StateTransitionEngine {
         csmt: &mut CSMT,
         block: &Block,
         evm_chain_id: u64,
+        exec_v2_activation: Option<u64>,
     ) -> Result<(([u8; 32], [u8; 32], [u8; 32]), Vec<ExecutionReceipt>), String> {
         // Validation of previous commits root in header
         if block.header.height > 1 {
@@ -657,13 +732,17 @@ impl StateTransitionEngine {
 
         preverify_signatures(&block.transactions);
         let mut receipts = Vec::with_capacity(block.transactions.len());
+        let v2 = exec_v2_active(exec_v2_activation, block.header.height);
+        let mut fee_batch = FeeBatch::default();
         for tx in &block.transactions {
-            let receipt = Self::execute_transaction_with_context(csmt, tx, block.header.proposer, block.header.height, block.header.timestamp, evm_chain_id).await?;
+            let batch = if v2 { Some(&mut fee_batch) } else { None };
+            let receipt = Self::execute_transaction_in_block_sync(csmt, tx, block.header.proposer, block.header.height, block.header.timestamp, evm_chain_id, batch)?;
             receipts.push(receipt);
         }
+        fee_batch.flush(csmt)?;
         let state_root = csmt.root();
         let tx_root = Block::compute_tx_root(&block.transactions);
-        let receipts_root = Block::compute_receipts_root(&receipts);
+        let receipts_root = if v2 { Block::compute_receipts_root_v2(&receipts) } else { Block::compute_receipts_root(&receipts) };
         Ok(((state_root, tx_root, receipts_root), receipts))
     }
 }

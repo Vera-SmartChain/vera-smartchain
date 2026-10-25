@@ -72,6 +72,7 @@ pub struct BuildInputs {
     pub key: SigningKey,
     pub chain_id: String,
     pub evm_chain_id: u64,
+    pub exec_v2_activation: Option<u64>,
     pub next_height: u64,
     pub prev_hash: [u8; 32],
     pub address: Address,
@@ -107,6 +108,7 @@ pub struct FullPruneResult {
 pub struct ExecSnapshot {
     pub csmt: CSMT,
     pub evm_chain_id: u64,
+    pub exec_v2_activation: Option<u64>,
     pub base_hash: [u8; 32],
 }
 
@@ -133,6 +135,8 @@ pub struct FullNode {
     pub last_commit_round: u64,
     /// First height decided by the Tendermint engine (None = legacy consensus only).
     pub tendermint_activation: Option<u64>,
+    /// First height executed under execution rules v2 (None = v1 only).
+    pub exec_v2_activation: Option<u64>,
     /// Mempool changed since the last save (admission no longer rewrites it every time).
     pub mempool_dirty: bool,
     /// Last full prune (re-execution of the pending txs); see `full_prune_due`.
@@ -384,6 +388,8 @@ impl FullNode {
         };
         let tendermint_activation = genesis.tendermint_activation_height
             .or_else(|| crate::genesis::builtin_tendermint_activation(&genesis.chain_id));
+        let exec_v2_activation = genesis.exec_v2_activation_height
+            .or_else(|| crate::genesis::builtin_exec_v2_activation(&genesis.chain_id));
 
         let mut node = Self {
             chain_id,
@@ -399,6 +405,7 @@ impl FullNode {
             last_committed_signatures,
             last_commit_round,
             tendermint_activation,
+            exec_v2_activation,
             mempool_dirty: false,
             last_full_prune: None,
             full_prune_requested: false,
@@ -609,7 +616,7 @@ impl FullNode {
         let mut projected_sender: Option<Vec<u8>> = None;
         if tx.nonce == sender_acc.nonce {
             let mut sim_csmt = self.csmt.clone();
-            let receipt = crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
+            let receipt = crate::state_transition::StateTransitionEngine::simulate_transaction_sync(
                 &mut sim_csmt,
                 &tx,
                 self.address,
@@ -648,7 +655,7 @@ impl FullNode {
             if is_contiguous && cached.is_some() {
                 let mut sim_csmt = self.csmt.clone();
                 sim_csmt.insert(tx.sender, cached.unwrap());
-                let receipt = crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
+                let receipt = crate::state_transition::StateTransitionEngine::simulate_transaction_sync(
                     &mut sim_csmt,
                     &tx,
                     self.address,
@@ -663,7 +670,7 @@ impl FullNode {
             } else if is_contiguous {
                 let mut sim_csmt = self.csmt.clone();
                 for ptx in &pending_sender_txs {
-                    let r = crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
+                    let r = crate::state_transition::StateTransitionEngine::simulate_transaction_sync(
                         &mut sim_csmt,
                         ptx,
                         self.address,
@@ -676,7 +683,7 @@ impl FullNode {
                     }
                 }
 
-                let receipt = crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
+                let receipt = crate::state_transition::StateTransitionEngine::simulate_transaction_sync(
                     &mut sim_csmt,
                     &tx,
                     self.address,
@@ -802,7 +809,7 @@ impl FullNode {
 
                 // Current nonce: direct simulation
                 if tx.nonce == expected_nonce {
-                    match crate::state_transition::StateTransitionEngine::execute_transaction_with_context_sync(
+                    match crate::state_transition::StateTransitionEngine::simulate_transaction_sync(
                         &mut sim_csmt,
                         &tx,
                         proposer,
@@ -969,7 +976,7 @@ impl FullNode {
         block.last_commit = last_commit;
 
         // Execute all transactions against CSMT
-        StateTransitionEngine::execute_block(&mut self.csmt, &mut block, self.evm_chain_id).await?;
+        StateTransitionEngine::execute_block(&mut self.csmt, &mut block, self.evm_chain_id, self.exec_v2_activation).await?;
 
         // Update local validator_set if altered during block execution
         if let Some(bytes) = self.csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
@@ -1018,6 +1025,7 @@ impl FullNode {
             key: self.keypair.clone().ok_or("Node has no validator key to propose")?,
             chain_id: self.chain_id.clone(),
             evm_chain_id: self.evm_chain_id,
+            exec_v2_activation: self.exec_v2_activation,
             next_height: self.height + 1,
             prev_hash: self.latest_block_hash,
             address: self.address,
@@ -1116,7 +1124,7 @@ impl FullNode {
 
             // Execute on a state COPY solely to populate state_root/tx_root
             let mut sim_csmt = inp.csmt.clone();
-            StateTransitionEngine::execute_block(&mut sim_csmt, &mut block, inp.evm_chain_id).await?;
+            StateTransitionEngine::execute_block(&mut sim_csmt, &mut block, inp.evm_chain_id, inp.exec_v2_activation).await?;
 
             // 1. Proposer policy: check if any transaction exceeded MAX_TX_LOGS_BYTES (256 KiB)
             let mut dropped_oversized_log_tx = false;
@@ -1242,7 +1250,7 @@ impl FullNode {
 
     /// State and parameters to execute a proposal on, taken under the node lock (O(1)).
     pub fn exec_snapshot(&self) -> ExecSnapshot {
-        ExecSnapshot { csmt: self.csmt.clone(), evm_chain_id: self.evm_chain_id, base_hash: self.latest_block_hash }
+        ExecSnapshot { csmt: self.csmt.clone(), evm_chain_id: self.evm_chain_id, exec_v2_activation: self.exec_v2_activation, base_hash: self.latest_block_hash }
     }
 
     /// Stores a proposal execution for apply_block (ignored there if the base moved on).
@@ -1256,7 +1264,7 @@ impl FullNode {
     /// match. Touches no node state, so it can run with no lock held.
     pub async fn execute_proposal(snap: ExecSnapshot, block: &Block) -> Result<(ExecutedBlock, Vec<crate::account::ExecutionReceipt>), String> {
         let mut sim = snap.csmt;
-        let ((sr, txr, rr), receipts) = StateTransitionEngine::validate_block_strict_with_receipts(&mut sim, block, snap.evm_chain_id).await?;
+        let ((sr, txr, rr), receipts) = StateTransitionEngine::validate_block_strict_with_receipts(&mut sim, block, snap.evm_chain_id, snap.exec_v2_activation).await?;
         if sr != block.header.state_root {
             return Err(format!(
                 "state_root mismatch: calc 0x{} != claimed 0x{}",
@@ -1530,7 +1538,7 @@ impl FullNode {
             Some(e) => (e.csmt, e.roots),
             None => {
                 let mut sim_csmt = self.csmt.clone();
-                let roots = StateTransitionEngine::validate_block_strict(&mut sim_csmt, &block, self.evm_chain_id).await?;
+                let roots = StateTransitionEngine::validate_block_strict(&mut sim_csmt, &block, self.evm_chain_id, self.exec_v2_activation).await?;
                 (sim_csmt, roots)
             }
         };

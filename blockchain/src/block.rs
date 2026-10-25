@@ -123,6 +123,15 @@ impl Block {
         Self::merkle_root_of_hashes(&hashes)
     }
 
+    /// `compute_receipts_root` under execution rules v2 (receipt `hash_v2`).
+    pub fn compute_receipts_root_v2(receipts: &[ExecutionReceipt]) -> [u8; 32] {
+        if receipts.is_empty() {
+            return [0u8; 32];
+        }
+        let hashes: Vec<[u8; 32]> = receipts.iter().map(|r| r.hash_v2()).collect();
+        Self::merkle_root_of_hashes(&hashes)
+    }
+
     fn merkle_root_of_hashes(leaves: &[[u8; 32]]) -> [u8; 32] {
         if leaves.is_empty() {
             return [0u8; 32];
