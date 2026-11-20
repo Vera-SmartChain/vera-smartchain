@@ -98,6 +98,58 @@ pub fn preverify_signatures(txs: &[Transaction]) {
 pub const BASE_TX_GAS: u64 = 21_000;
 pub const GAS_PER_INSTRUCTION: u64 = 100;
 
+/// Activation heights of the protocol upgrades that change block execution
+/// (None = not active on this chain).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ForkHeights {
+    /// VIP-001: document registry, per-document fee, consensus minimum gas price.
+    pub registry: Option<u64>,
+    /// VIP-002: validator rewards from the reward pool.
+    pub rewards: Option<u64>,
+    /// VIP-003: governance by validator vote.
+    pub governance: Option<u64>,
+    /// VIP-003 voting windows (production values unless a devnet genesis shortens them).
+    pub gov_timing: crate::governance::GovTiming,
+    /// VIP-003: the governance key keeps the validator allowlist (testnet only).
+    pub gov_key_allowlist: bool,
+    /// VIP-004: open validator entry, equivocation slashing, time-based unbonding.
+    pub open_entry: Option<u64>,
+    /// VIP-004 unbonding and churn windows (production values unless a devnet genesis shortens them).
+    pub open_timing: crate::open_staking::OpenTiming,
+    /// `hash256(chain_id)`, for VIP-004 evidence signatures.
+    pub chain_id_hash: [u8; 32],
+}
+
+impl ForkHeights {
+    pub fn gov_config(&self) -> crate::governance::GovConfig {
+        crate::governance::GovConfig { timing: self.gov_timing, key_allowlist: self.gov_key_allowlist }
+    }
+
+    pub fn open_config(&self) -> crate::open_staking::OpenConfig {
+        crate::open_staking::OpenConfig { timing: self.open_timing, chain_id_hash: self.chain_id_hash }
+    }
+}
+
+/// Prepares a state copy so that simulating a tx on it follows the rules of a block at
+/// `height` (activation writes included). Used by mempool admission and pruning.
+/// The CSMT keys of the records of VIP-001..004 (fee parameters, rewards, governance, open
+/// entry). They are public hashes, so a transaction could name one as `to`. If it paid an
+/// account into one before its record existed, the record could not be created and every later
+/// block would fail to load it. Execution and mempool admission refuse any transaction to
+/// these keys.
+pub fn is_reserved_state_key(a: &Address) -> bool {
+    *a == crate::registry::FEE_PARAMS_KEY
+        || *a == crate::rewards::REWARD_STATE_KEY
+        || *a == crate::governance::GOV_STATE_KEY
+        || *a == crate::open_staking::OPEN_STATE_KEY
+}
+
+pub fn apply_next_block_activations(csmt: &mut CSMT, height: u64, timestamp: u64, forks: &ForkHeights) {
+    crate::registry::activate_if_due(csmt, height, forks.registry);
+    crate::governance::activate_if_due(csmt, height, timestamp, forks.governance, forks.gov_config());
+    crate::open_staking::activate_if_due(csmt, height, forks.open_entry, forks.open_config());
+}
+
 pub const BURN_ADDRESS: Address = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xde, 0xad,
@@ -157,6 +209,25 @@ impl StateTransitionEngine {
         block_height: u64,
     ) -> Result<ExecutionReceipt, String> {
         Self::execute_transaction_with_context_sync(csmt, tx, proposer, block_height, 0, 83721)
+    }
+
+    /// The per-block system steps that run after unbonding maturation and before the
+    /// transactions. Shared by block execution and strict validation.
+    fn apply_block_systems(csmt: &mut CSMT, block: &Block, forks: &ForkHeights) -> Result<(), String> {
+        // 2b. VIP-004: activation, then queued stake enters within the churn limit
+        crate::open_staking::process_block(csmt, block.header.height, block.header.timestamp, forks.open_entry, forks.open_config())?;
+
+        // 3. VIP-001 activation: default fee parameters at the first block >= activation
+        crate::registry::activate_if_due(csmt, block.header.height, forks.registry);
+
+        // 4. VIP-002: validator reward from the pool, to the signers of last_commit
+        crate::rewards::apply_block_reward(
+            csmt, block.header.height, block.header.timestamp, block.header.proposer, &block.last_commit, forks.rewards,
+        )?;
+
+        // 5. VIP-003: activation, then passed proposals past their timelock, then expiry
+        crate::governance::process_block(csmt, block.header.height, block.header.timestamp, forks.governance, forks.gov_config())?;
+        Ok(())
     }
 
     pub async fn execute_transaction(
@@ -236,6 +307,11 @@ impl StateTransitionEngine {
             ));
         }
 
+        // 2b. A reserved state key holds a record, never an account (see is_reserved_state_key).
+        if tx.to.map_or(false, |to| is_reserved_state_key(&to)) {
+            return Err("Transactions to a reserved state key are refused".to_string());
+        }
+
         // 3. Load or initialize sender account
         let mut sender_account = match csmt.get(&tx.sender) {
             Some(bytes) => Account::from_bytes(bytes)?,
@@ -252,7 +328,54 @@ impl StateTransitionEngine {
             ));
         }
 
-        // 5. Solvency Check for Value + Gas Limit
+        // 4b. VIP-001 (active once FeeParams exist): consensus minimum gas price, and the
+        // registry operation with its per-document fee. A bad payload rejects the tx.
+        let fee_params = crate::registry::load_params(csmt)?;
+        if let Some(p) = &fee_params {
+            if tx.gas_price < p.min_gas_price_wei {
+                return Err(format!(
+                    "Gas price {} below the network minimum gas price {}",
+                    tx.gas_price, p.min_gas_price_wei
+                ));
+            }
+        }
+        let registry_op = match &fee_params {
+            Some(_) if tx.to == Some(crate::registry::REGISTRY_SYSTEM_ADDRESS) => {
+                if tx.amount != 0 {
+                    return Err("Registry transactions must have amount 0".to_string());
+                }
+                Some(crate::registry::RegistryOp::parse(&tx.program)?)
+            }
+            _ => None,
+        };
+        // 4c. VIP-003 (active once its state exists): governance operations.
+        let gov_op = if tx.to == Some(crate::governance::GOVERNANCE_SYSTEM_ADDRESS) && csmt.get(&crate::governance::GOV_STATE_KEY).is_some() {
+            if tx.amount != 0 {
+                return Err("Governance transactions must have amount 0".to_string());
+            }
+            Some(crate::governance::GovOp::parse(&tx.program)?)
+        } else {
+            None
+        };
+        // 4c'. Staking needs a native ed25519 key (all networks, before and after VIP-004).
+        if tx.to == Some(crate::account::STAKING_SYSTEM_ADDRESS) {
+            crate::consensus::check_staking_key(tx.raw_evm.is_some(), &tx.public_key)?;
+        }
+        // 4d. VIP-004 (active once its state exists): equivocation evidence, from anyone.
+        let evidence = if tx.to == Some(crate::open_staking::EVIDENCE_SYSTEM_ADDRESS) && csmt.get(&crate::open_staking::OPEN_STATE_KEY).is_some() {
+            if tx.amount != 0 {
+                return Err("Evidence transactions must have amount 0".to_string());
+            }
+            Some(crate::open_staking::Evidence::parse(&tx.program)?)
+        } else {
+            None
+        };
+        let registry_fee = match (&registry_op, &fee_params) {
+            (Some(op), Some(p)) => crate::registry::registry_fee(op, p),
+            _ => 0,
+        };
+
+        // 5. Solvency Check for Value + Gas Limit (+ registry fee, VIP-001)
         let max_gas_cost = (tx.gas_limit as u128).saturating_mul(tx.gas_price as u128);
         let is_staking_non_debit = tx.to == Some(crate::account::STAKING_SYSTEM_ADDRESS)
             && (tx.program.starts_with(b"unstake") || tx.program == b"unjail" || tx.program.starts_with(b"allow:") || tx.program.starts_with(b"disallow:") || tx.program.starts_with(b"set_governance:"));
@@ -260,7 +383,8 @@ impl StateTransitionEngine {
             max_gas_cost
         } else {
             tx.amount.saturating_add(max_gas_cost)
-        };
+        }
+        .saturating_add(registry_fee);
         if sender_account.balance < total_required {
             return Err(format!(
                 "Insufficient balance. Required: {}, Available: {}",
@@ -288,8 +412,72 @@ impl StateTransitionEngine {
         // State Journal for mutation isolation
         let mut staged_recipient: Option<(Address, Account)> = None;
 
+        // VIP-001 DOCUMENT REGISTRY (native, before EVM; EVM-signed txs reach it as 0x…1100)
+        if let (Some(op), Some(params)) = (&registry_op, &fee_params) {
+            let governance = match csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
+                Some(bytes) => crate::consensus::ValidatorSet::from_bytes(bytes)?.governance_address,
+                None => None,
+            };
+            let gov_state = crate::governance::load_state(csmt)?;
+            let ctx = crate::registry::ApplyCtx {
+                sender: tx.sender,
+                governance,
+                height: block_height,
+                timestamp: block_timestamp,
+                by_vote: false,
+                key_retired: gov_state.is_some(),
+                registrations_paused: gov_state.map_or(false, |s| block_timestamp < s.paused_until_ts),
+            };
+            evm_logs = crate::registry::apply(csmt, op, params, &ctx)?;
+            sender_account.balance -= registry_fee;
+            execution_success = true;
+        } else if let Some(op) = &gov_op {
+            // VIP-003: proposals, votes and the emergency pause.
+            let ctx = crate::governance::GovCtx { sender: tx.sender, height: block_height, timestamp: block_timestamp };
+            evm_logs = crate::governance::apply_op(csmt, op, &ctx)?;
+            execution_success = true;
+        } else if let Some(ev) = &evidence {
+            // VIP-004: equivocation evidence (forced exit, tombstone, slash).
+            evm_logs = crate::open_staking::apply_evidence(csmt, ev, block_height, block_timestamp)?;
+            execution_success = true;
+        } else if tx.to == Some(crate::account::STAKING_SYSTEM_ADDRESS)
+            && !tx.program.starts_with(b"set_governance:")
+            && csmt.get(&crate::open_staking::OPEN_STATE_KEY).is_some()
+        {
+            // VIP-004: open entry. No allowlist; stake enters through the churn queue and
+            // leaves through a time-based unbonding.
+            if tx.program.starts_with(b"unstake") {
+                crate::open_staking::unstake(csmt, &tx.public_key, tx.amount, block_height, block_timestamp)
+                    .map_err(|e| format!("On-chain unstake failure: {}", e))?;
+            } else if tx.program == b"unjail" {
+                crate::open_staking::check_unjail(csmt, &tx.public_key)?;
+                let mut val_set = match csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
+                    Some(bytes) => crate::consensus::ValidatorSet::from_bytes(bytes)?,
+                    None => crate::consensus::ValidatorSet::new(vec![]),
+                };
+                val_set.unjail(&tx.public_key).map_err(|e| format!("On-chain unjail failure: {}", e))?;
+                csmt.insert(crate::account::VALIDATOR_SET_CSMT_KEY, val_set.to_bytes());
+            } else if tx.program.starts_with(b"allow:") || tx.program.starts_with(b"disallow:") {
+                return Err("Validator entry is open to stake on this network (VIP-004): there is no allowlist".to_string());
+            } else {
+                if sender_account.balance < tx.amount {
+                    return Err(format!(
+                        "Insufficient balance to stake: balance {} < amount {}",
+                        sender_account.balance, tx.amount
+                    ));
+                }
+                crate::open_staking::queue_stake(csmt, tx.sender, tx.public_key, tx.amount, block_timestamp)?;
+                sender_account.balance -= tx.amount;
+                let mut staking_sys_acc = match csmt.get(&crate::account::STAKING_SYSTEM_ADDRESS) {
+                    Some(bytes) => Account::from_bytes(bytes)?,
+                    None => Account::new(0),
+                };
+                staking_sys_acc.balance = staking_sys_acc.balance.saturating_add(tx.amount);
+                csmt.insert(crate::account::STAKING_SYSTEM_ADDRESS, staking_sys_acc.to_bytes());
+            }
+            execution_success = true;
         // CHECK IF TRANSACTION IS TARGETED TO CANONICAL STAKING MODULE
-        if tx.to == Some(crate::account::STAKING_SYSTEM_ADDRESS) {
+        } else if tx.to == Some(crate::account::STAKING_SYSTEM_ADDRESS) {
             let mut val_set = match csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
                 Some(bytes) => crate::consensus::ValidatorSet::from_bytes(bytes)?,
                 None => crate::consensus::ValidatorSet::new(vec![]),
@@ -319,6 +507,11 @@ impl StateTransitionEngine {
                         return Err(format!("On-chain unjail failure: {}", e));
                     }
                 }
+            } else if (tx.program.starts_with(b"allow:") || tx.program.starts_with(b"disallow:"))
+                && crate::governance::load_state(csmt)?.map_or(false, |s| !s.key_allowlist)
+            {
+                // VIP-003: the allowlist changes only by validator vote (on testnet the key keeps it).
+                return Err("The validator allowlist is changed by validator vote (VIP-003), not by the governance key".to_string());
             } else if tx.program.starts_with(b"allow:") {
                 // GOVERNANCE: ADD VALIDATOR TO ALLOWLIST
                 let gov_addr = val_set.governance_address.ok_or_else(|| "No governance account configured in state".to_string())?;
@@ -500,7 +693,7 @@ impl StateTransitionEngine {
         // 70% -> Block proposer (Validator compensation)
         // 15% -> Network Stability Pool (Reserve for low-volume periods)
         // 15% -> Permanent Burn Address (0x000...dead)
-        let total_fee = (gas_used as u128).saturating_mul(tx.gas_price as u128);
+        let total_fee = (gas_used as u128).saturating_mul(tx.gas_price as u128).saturating_add(registry_fee);
         if total_fee > 0 {
             let proposer_fee = (total_fee.saturating_mul(70)) / 100;
             let stability_fee = (total_fee.saturating_mul(15)) / 100;
@@ -563,6 +756,17 @@ impl StateTransitionEngine {
         evm_chain_id: u64,
         exec_v2_activation: Option<u64>,
     ) -> Result<[u8; 32], String> {
+        Self::execute_block_with_forks(csmt, block, evm_chain_id, exec_v2_activation, ForkHeights::default()).await
+    }
+
+    /// `execute_block` with the VIP-001/VIP-002 activation heights (None = never active).
+    pub async fn execute_block_with_forks(
+        csmt: &mut CSMT,
+        block: &mut Block,
+        evm_chain_id: u64,
+        exec_v2_activation: Option<u64>,
+        forks: ForkHeights,
+    ) -> Result<[u8; 32], String> {
         // 1. Liveness audit and slashing from block.last_commit (for blocks > 1)
         if block.header.height > 1 {
             if let Some(val_set_bytes) = csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
@@ -572,7 +776,11 @@ impl StateTransitionEngine {
                         .iter()
                         .map(|c| c.validator_pubkey)
                         .collect();
-                    val_set.audit_liveness(&active_pubkeys);
+                    if csmt.get(&crate::open_staking::OPEN_STATE_KEY).is_some() {
+                        val_set.audit_liveness_active(&active_pubkeys);
+                    } else {
+                        val_set.audit_liveness(&active_pubkeys);
+                    }
 
                     let slashed_invalids = val_set.slash_inactive_validators();
                     for (_val_addr, penalty) in slashed_invalids {
@@ -598,7 +806,7 @@ impl StateTransitionEngine {
         // 2. Process maturation of unbondings reaching release height
         if let Some(val_set_bytes) = csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
             if let Ok(mut val_set) = crate::consensus::ValidatorSet::from_bytes(val_set_bytes) {
-                let maturing = val_set.process_maturing_unbondings(block.header.height);
+                let maturing = val_set.process_maturing_unbondings(block.header.height, block.header.timestamp);
                 if !maturing.is_empty() {
                     let mut staking_sys_acc = match csmt.get(&crate::account::STAKING_SYSTEM_ADDRESS) {
                         Some(b) => Account::from_bytes(b)?,
@@ -618,6 +826,10 @@ impl StateTransitionEngine {
                 }
             }
         }
+
+        // 2b-5. VIP-004 entry, VIP-001 activation, VIP-002 reward, VIP-003 governance (one
+        // helper for both paths: a divergence between them would split consensus).
+        Self::apply_block_systems(csmt, block, &forks)?;
 
         preverify_signatures(&block.transactions);
         let mut receipts = Vec::with_capacity(block.transactions.len());
@@ -662,6 +874,17 @@ impl StateTransitionEngine {
         evm_chain_id: u64,
         exec_v2_activation: Option<u64>,
     ) -> Result<(([u8; 32], [u8; 32], [u8; 32]), Vec<ExecutionReceipt>), String> {
+        Self::validate_block_strict_with_forks(csmt, block, evm_chain_id, exec_v2_activation, ForkHeights::default()).await
+    }
+
+    /// `validate_block_strict_with_receipts` with the VIP-001 activation height.
+    pub async fn validate_block_strict_with_forks(
+        csmt: &mut CSMT,
+        block: &Block,
+        evm_chain_id: u64,
+        exec_v2_activation: Option<u64>,
+        forks: ForkHeights,
+    ) -> Result<(([u8; 32], [u8; 32], [u8; 32]), Vec<ExecutionReceipt>), String> {
         // Validation of previous commits root in header
         if block.header.height > 1 {
             let expected_commit_hash = Block::compute_commits_root(&block.last_commit);
@@ -683,7 +906,11 @@ impl StateTransitionEngine {
                         .iter()
                         .map(|c| c.validator_pubkey)
                         .collect();
-                    val_set.audit_liveness(&active_pubkeys);
+                    if csmt.get(&crate::open_staking::OPEN_STATE_KEY).is_some() {
+                        val_set.audit_liveness_active(&active_pubkeys);
+                    } else {
+                        val_set.audit_liveness(&active_pubkeys);
+                    }
 
                     let slashed_invalids = val_set.slash_inactive_validators();
                     for (_val_addr, penalty) in slashed_invalids {
@@ -709,7 +936,7 @@ impl StateTransitionEngine {
         // 2. Process maturation of unbondings reaching release height
         if let Some(val_set_bytes) = csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
             if let Ok(mut val_set) = crate::consensus::ValidatorSet::from_bytes(val_set_bytes) {
-                let maturing = val_set.process_maturing_unbondings(block.header.height);
+                let maturing = val_set.process_maturing_unbondings(block.header.height, block.header.timestamp);
                 if !maturing.is_empty() {
                     let mut staking_sys_acc = match csmt.get(&crate::account::STAKING_SYSTEM_ADDRESS) {
                         Some(b) => Account::from_bytes(b)?,
@@ -729,6 +956,10 @@ impl StateTransitionEngine {
                 }
             }
         }
+
+        // 2b-5. VIP-004 entry, VIP-001 activation, VIP-002 reward, VIP-003 governance (one
+        // helper for both paths: a divergence between them would split consensus).
+        Self::apply_block_systems(csmt, block, &forks)?;
 
         preverify_signatures(&block.transactions);
         let mut receipts = Vec::with_capacity(block.transactions.len());

@@ -51,6 +51,28 @@ pub struct GenesisConfig {
     /// from `builtin_exec_v2_activation` instead.
     #[serde(default)]
     pub exec_v2_activation_height: Option<u64>,
+    /// First height of the VIP-001 document registry and fee rules. None = use
+    /// `builtin_registry_activation` instead.
+    #[serde(default)]
+    pub registry_activation_height: Option<u64>,
+    /// First height of VIP-002 validator rewards. None = use `builtin_rewards_activation`.
+    #[serde(default)]
+    pub rewards_activation_height: Option<u64>,
+    /// First height of VIP-003 governance by validator vote. None = use
+    /// `builtin_governance_activation`.
+    #[serde(default)]
+    pub governance_activation_height: Option<u64>,
+    /// Devnet only: shorter VIP-003 voting windows for tests. None = production values.
+    #[serde(default)]
+    pub governance_timing: Option<crate::governance::GovTiming>,
+    /// First height of VIP-004 (open validator entry by stake). None = use
+    /// `builtin_open_entry_activation`.
+    #[serde(default)]
+    pub open_entry_activation_height: Option<u64>,
+    /// Devnet only: shorter VIP-004 unbonding and churn windows for tests. Ignored outside
+    /// `is_test_chain`.
+    #[serde(default)]
+    pub open_entry_timing: Option<crate::open_staking::OpenTiming>,
 }
 
 /// Tendermint activation height of public networks, fixed per release (a coordinated,
@@ -73,6 +95,58 @@ pub fn builtin_exec_v2_activation(chain_id: &str) -> Option<u64> {
         _ => None,
     }
 }
+
+/// Chains where test-only settings are honored: the governance key's allowlist, and the
+/// shorter VIP-003/VIP-004 windows from a devnet genesis file (local devnets run with the
+/// testnet id). Fail-closed: any other id, including a misspelled mainnet id, gets the
+/// production rules.
+pub fn is_test_chain(chain_id: &str) -> bool {
+    matches!(chain_id, "vera-testnet-1")
+}
+
+/// VIP-003: whether the governance key keeps `allow:`/`disallow:` after activation.
+/// Testnet: yes (testnet VERA is free from the faucet, so stake is no barrier and validators
+/// are approved). Any other chain: never (mainnet entry is open to stake with VIP-004).
+pub fn builtin_key_keeps_allowlist(chain_id: &str) -> bool {
+    is_test_chain(chain_id)
+}
+
+/// Activation height of VIP-004 (open validator entry by stake, equivocation slashing,
+/// time-based unbonding) on public networks. Mainnet only: the testnet keeps entry by
+/// approval and never gets a height here. None = not scheduled yet.
+pub fn builtin_open_entry_activation(chain_id: &str) -> Option<u64> {
+    match chain_id {
+        "vera-testnet-1" => None,
+        _ => None,
+    }
+}
+
+/// Activation height of VIP-003 (governance by validator vote) on public networks.
+/// None = not scheduled yet.
+pub fn builtin_governance_activation(chain_id: &str) -> Option<u64> {
+    match chain_id {
+        _ => None,
+    }
+}
+
+/// Activation height of VIP-002 (validator rewards from the reward pool) on public
+/// networks. None = not scheduled yet.
+pub fn builtin_rewards_activation(chain_id: &str) -> Option<u64> {
+    match chain_id {
+        _ => None,
+    }
+}
+
+/// Activation height of VIP-001 (document registry, per-document fee, consensus minimum
+/// gas price) on public networks. None = not scheduled yet.
+pub fn builtin_registry_activation(chain_id: &str) -> Option<u64> {
+    match chain_id {
+        _ => None,
+    }
+}
+
+/// Minimum validator stake on mainnet, in VERA.
+pub const MAINNET_MIN_VALIDATOR_STAKE_VERA: u128 = 10_000;
 
 fn default_evm_chain_id() -> u64 {
     83721
@@ -99,6 +173,22 @@ fn default_permissioned_validators() -> bool {
 }
 
 impl GenesisConfig {
+    /// VIP-001..004 activation heights and settings for this chain (genesis values for
+    /// devnets, built-in values for public networks; test-only settings fail closed).
+    pub fn fork_heights(&self) -> crate::state_transition::ForkHeights {
+        let test = is_test_chain(&self.chain_id);
+        crate::state_transition::ForkHeights {
+            registry: self.registry_activation_height.or_else(|| builtin_registry_activation(&self.chain_id)),
+            rewards: self.rewards_activation_height.or_else(|| builtin_rewards_activation(&self.chain_id)),
+            governance: self.governance_activation_height.or_else(|| builtin_governance_activation(&self.chain_id)),
+            gov_timing: if test { self.governance_timing.unwrap_or_default() } else { crate::governance::GovTiming::PRODUCTION },
+            gov_key_allowlist: builtin_key_keeps_allowlist(&self.chain_id),
+            open_entry: self.open_entry_activation_height.or_else(|| builtin_open_entry_activation(&self.chain_id)),
+            open_timing: if test { self.open_entry_timing.unwrap_or_default() } else { crate::open_staking::OpenTiming::PRODUCTION },
+            chain_id_hash: crate::chain_hash::hash256(self.chain_id.as_bytes()),
+        }
+    }
+
     pub fn min_validator_stake_wei(&self) -> u128 {
         self.min_validator_stake
             .parse::<u128>()
@@ -263,6 +353,12 @@ impl GenesisConfig {
             validator_allowlist: vec![address_to_hex(&val_addr)],
             tendermint_activation_height: None,
             exec_v2_activation_height: None,
+            registry_activation_height: None,
+            rewards_activation_height: None,
+            governance_activation_height: None,
+            governance_timing: None,
+            open_entry_activation_height: None,
+            open_entry_timing: None,
         };
 
         (cfg, val_signing_key)
@@ -275,7 +371,8 @@ impl GenesisConfig {
         }
 
         let wei_unit: u128 = 1_000_000_000_000_000_000;
-        let stake_per_val = (32 * wei_unit).to_string(); // Minimum stake of 32 VERA
+        // Mainnet minimum stake: 10,000 VERA (decided 2026-11-18). The testnet keeps 32.
+        let stake_per_val = (MAINNET_MIN_VALIDATOR_STAKE_VERA * wei_unit).to_string();
 
         let initial_validators: Vec<GenesisValidator> = initial_validator_pubkeys
             .iter()
@@ -320,7 +417,7 @@ impl GenesisConfig {
             validator_count: initial_validators.len(),
             initial_validators,
             initial_accounts,
-            min_validator_stake: (32 * wei_unit).to_string(),
+            min_validator_stake: (MAINNET_MIN_VALIDATOR_STAKE_VERA * wei_unit).to_string(),
             max_active_validators: 50,
             unbonding_period_blocks: 50400,
             max_missed_blocks: 100,
@@ -329,6 +426,12 @@ impl GenesisConfig {
             validator_allowlist: vec![],
             tendermint_activation_height: None,
             exec_v2_activation_height: None,
+            registry_activation_height: None,
+            rewards_activation_height: None,
+            governance_activation_height: None,
+            governance_timing: None,
+            open_entry_activation_height: None,
+            open_entry_timing: None,
         })
     }
 }

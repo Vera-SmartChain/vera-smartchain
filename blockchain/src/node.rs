@@ -73,6 +73,7 @@ pub struct BuildInputs {
     pub chain_id: String,
     pub evm_chain_id: u64,
     pub exec_v2_activation: Option<u64>,
+    pub forks: crate::state_transition::ForkHeights,
     pub next_height: u64,
     pub prev_hash: [u8; 32],
     pub address: Address,
@@ -97,6 +98,7 @@ pub struct FullPruneSnapshot {
     pub proposer: Address,
     pub next_height: u64,
     pub evm_chain_id: u64,
+    pub forks: crate::state_transition::ForkHeights,
 }
 
 /// Txs a full prune would drop: (tx hash, sender, sender account bytes in the snapshot).
@@ -109,6 +111,7 @@ pub struct ExecSnapshot {
     pub csmt: CSMT,
     pub evm_chain_id: u64,
     pub exec_v2_activation: Option<u64>,
+    pub forks: crate::state_transition::ForkHeights,
     pub base_hash: [u8; 32],
 }
 
@@ -137,6 +140,8 @@ pub struct FullNode {
     pub tendermint_activation: Option<u64>,
     /// First height executed under execution rules v2 (None = v1 only).
     pub exec_v2_activation: Option<u64>,
+    /// First height of the VIP-001 registry and fee rules (None = not scheduled).
+    pub forks: crate::state_transition::ForkHeights,
     /// Mempool changed since the last save (admission no longer rewrites it every time).
     pub mempool_dirty: bool,
     /// Last full prune (re-execution of the pending txs); see `full_prune_due`.
@@ -390,6 +395,7 @@ impl FullNode {
             .or_else(|| crate::genesis::builtin_tendermint_activation(&genesis.chain_id));
         let exec_v2_activation = genesis.exec_v2_activation_height
             .or_else(|| crate::genesis::builtin_exec_v2_activation(&genesis.chain_id));
+        let forks = genesis.fork_heights();
 
         let mut node = Self {
             chain_id,
@@ -406,6 +412,7 @@ impl FullNode {
             last_commit_round,
             tendermint_activation,
             exec_v2_activation,
+            forks,
             mempool_dirty: false,
             last_full_prune: None,
             full_prune_requested: false,
@@ -441,6 +448,30 @@ impl FullNode {
                 let _ = std::fs::write(path, json_str);
             }
         }
+    }
+
+    /// Activation heights of the execution-changing upgrades on this chain.
+    pub fn forks(&self) -> crate::state_transition::ForkHeights {
+        self.forks
+    }
+
+    /// VIP-004: sends equivocation evidence this node saw, signed with the node key (the node
+    /// pays the fee). Refused before activation or on a node without a key.
+    pub fn submit_evidence(&mut self, ev: &crate::open_staking::Evidence) -> Result<[u8; 32], String> {
+        let key = self.keypair.clone().ok_or("no node key to sign the evidence")?;
+        let sender = crate::chain_hash::hash256(&key.verifying_key().to_bytes());
+        let nonce = match self.csmt.get(&sender) {
+            Some(b) => crate::account::Account::from_bytes(b)?.nonce,
+            None => 0,
+        } + self.mempool.iter().filter(|t| t.sender == sender).count() as u64;
+        let gas_price = match crate::registry::effective_params(&self.csmt, self.height + 1, self.forks.registry) {
+            Ok(Some(p)) => p.min_gas_price_wei,
+            _ => 1_000_000_000,
+        };
+        let program = ev.encode();
+        let gas_limit = 21_000 + 10 * program.len() as u64 + 5_000;
+        let tx = Transaction::new(&self.chain_id, &key, nonce, Some(crate::open_staking::EVIDENCE_SYSTEM_ADDRESS), 0, gas_limit, gas_price, program);
+        self.submit_transaction(tx)
     }
 
     /// Submits a transaction to the Mempool with Anti-DoS, Anti-Replay, and Solvency protection
@@ -581,8 +612,43 @@ impl FullNode {
             ));
         }
 
+        // 4.1b VIP-001 admission policy: nothing to the registry before activation, and
+        // the consensus minimum gas price (also enforced at execution) for every tx.
+        let fee_params = crate::registry::effective_params(&self.csmt, self.height + 1, self.forks.registry)?;
+        if tx.to == Some(crate::registry::REGISTRY_SYSTEM_ADDRESS) && fee_params.is_none() {
+            return Err("Document registry is not active yet on this network".to_string());
+        }
+        if tx.to == Some(crate::governance::GOVERNANCE_SYSTEM_ADDRESS)
+            && !crate::governance::is_active_for(&self.csmt, self.height + 1, self.forks.governance)
+        {
+            return Err("On-chain governance is not active yet on this network".to_string());
+        }
+        if tx.to.map_or(false, |to| crate::state_transition::is_reserved_state_key(&to)) {
+            return Err("Transactions to a reserved state key are refused".to_string());
+        }
+        if tx.to == Some(crate::account::STAKING_SYSTEM_ADDRESS) {
+            crate::consensus::check_staking_key(tx.raw_evm.is_some(), &tx.public_key)?;
+        }
+        if tx.to == Some(crate::open_staking::EVIDENCE_SYSTEM_ADDRESS)
+            && !crate::open_staking::is_active_for(&self.csmt, self.height + 1, self.forks.open_entry)
+        {
+            return Err("Equivocation evidence (VIP-004) is not active yet on this network".to_string());
+        }
+        if let Some(p) = &fee_params {
+            if tx.gas_price < p.min_gas_price_wei {
+                return Err(format!(
+                    "Gas price {} below the network minimum gas price {}",
+                    tx.gas_price, p.min_gas_price_wei
+                ));
+            }
+        }
+
         // 4.2 Minimum solvency check for mempool admission
-        let max_gas_cost = (tx.gas_limit as u128).saturating_mul(tx.gas_price as u128);
+        let mut max_gas_cost = (tx.gas_limit as u128).saturating_mul(tx.gas_price as u128);
+        if let (Some(p), true) = (&fee_params, tx.to == Some(crate::registry::REGISTRY_SYSTEM_ADDRESS)) {
+            let op = crate::registry::RegistryOp::parse(&tx.program)?;
+            max_gas_cost = max_gas_cost.saturating_add(crate::registry::registry_fee(&op, p));
+        }
         let is_staking_non_debit = tx.to == Some(crate::account::STAKING_SYSTEM_ADDRESS)
             && (tx.program.starts_with(b"unstake") || tx.program == b"unjail" || tx.program.starts_with(b"allow:") || tx.program.starts_with(b"disallow:") || tx.program.starts_with(b"set_governance:"));
         let total_required = if is_staking_non_debit {
@@ -616,6 +682,8 @@ impl FullNode {
         let mut projected_sender: Option<Vec<u8>> = None;
         if tx.nonce == sender_acc.nonce {
             let mut sim_csmt = self.csmt.clone();
+            // Simulate under the rules of the next block (VIP-001 activation included).
+            crate::state_transition::apply_next_block_activations(&mut sim_csmt, next_height, now_ts, &self.forks);
             let receipt = crate::state_transition::StateTransitionEngine::simulate_transaction_sync(
                 &mut sim_csmt,
                 &tx,
@@ -761,7 +829,7 @@ impl FullNode {
         if initial_len == 0 {
             return 0;
         }
-        let keep = Self::full_prune_keep(&self.csmt, &self.mempool, self.address, self.height + 1, self.evm_chain_id);
+        let keep = Self::full_prune_keep(&self.csmt, &self.mempool, self.address, self.height + 1, self.evm_chain_id, self.forks);
         self.mempool.retain(|t| keep.contains(&t.tx_hash()));
         self.admission_cache.clear();
         self.mempool_bytes = None;
@@ -776,7 +844,13 @@ impl FullNode {
     /// Hashes of the pending txs a full prune keeps (pure). Executes each sender's txs in
     /// nonce order on a copy of `csmt`: drops used nonces, senders without an account,
     /// txs that fail their rules, and txs too far past the sender's next nonce.
-    pub fn full_prune_keep(csmt: &CSMT, mempool: &[Transaction], proposer: Address, next_height: u64, evm_chain_id: u64) -> std::collections::HashSet<[u8; 32]> {
+    pub fn full_prune_keep(csmt: &CSMT, mempool: &[Transaction], proposer: Address, next_height: u64, evm_chain_id: u64, forks: crate::state_transition::ForkHeights) -> std::collections::HashSet<[u8; 32]> {
+        // Judge pending txs by the rules of the next block: from the VIP-001 activation
+        // block on, txs priced below the new minimum must go, or they pin their nonce.
+        let mut next_rules = csmt.clone();
+        let now_for_rules = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        crate::state_transition::apply_next_block_activations(&mut next_rules, next_height, now_for_rules, &forks);
+        let csmt = &next_rules;
         let now_ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -853,13 +927,14 @@ impl FullNode {
             proposer: self.address,
             next_height: self.height + 1,
             evm_chain_id: self.evm_chain_id,
+            forks: self.forks,
         }
     }
 
     /// The txs of `snap` a full prune would drop, each with its sender's account bytes in
     /// the snapshot (pure; runs off the node lock).
     pub fn compute_full_prune(snap: FullPruneSnapshot) -> FullPruneResult {
-        let keep = Self::full_prune_keep(&snap.csmt, &snap.mempool, snap.proposer, snap.next_height, snap.evm_chain_id);
+        let keep = Self::full_prune_keep(&snap.csmt, &snap.mempool, snap.proposer, snap.next_height, snap.evm_chain_id, snap.forks);
         let drop = snap.mempool.iter()
             .filter(|t| !keep.contains(&t.tx_hash()))
             .map(|t| (t.tx_hash(), t.sender, snap.csmt.get(&t.sender).cloned()))
@@ -976,7 +1051,7 @@ impl FullNode {
         block.last_commit = last_commit;
 
         // Execute all transactions against CSMT
-        StateTransitionEngine::execute_block(&mut self.csmt, &mut block, self.evm_chain_id, self.exec_v2_activation).await?;
+        StateTransitionEngine::execute_block_with_forks(&mut self.csmt, &mut block, self.evm_chain_id, self.exec_v2_activation, self.forks).await?;
 
         // Update local validator_set if altered during block execution
         if let Some(bytes) = self.csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
@@ -1026,6 +1101,7 @@ impl FullNode {
             chain_id: self.chain_id.clone(),
             evm_chain_id: self.evm_chain_id,
             exec_v2_activation: self.exec_v2_activation,
+            forks: self.forks,
             next_height: self.height + 1,
             prev_hash: self.latest_block_hash,
             address: self.address,
@@ -1124,7 +1200,7 @@ impl FullNode {
 
             // Execute on a state COPY solely to populate state_root/tx_root
             let mut sim_csmt = inp.csmt.clone();
-            StateTransitionEngine::execute_block(&mut sim_csmt, &mut block, inp.evm_chain_id, inp.exec_v2_activation).await?;
+            StateTransitionEngine::execute_block_with_forks(&mut sim_csmt, &mut block, inp.evm_chain_id, inp.exec_v2_activation, inp.forks).await?;
 
             // 1. Proposer policy: check if any transaction exceeded MAX_TX_LOGS_BYTES (256 KiB)
             let mut dropped_oversized_log_tx = false;
@@ -1250,7 +1326,7 @@ impl FullNode {
 
     /// State and parameters to execute a proposal on, taken under the node lock (O(1)).
     pub fn exec_snapshot(&self) -> ExecSnapshot {
-        ExecSnapshot { csmt: self.csmt.clone(), evm_chain_id: self.evm_chain_id, exec_v2_activation: self.exec_v2_activation, base_hash: self.latest_block_hash }
+        ExecSnapshot { csmt: self.csmt.clone(), evm_chain_id: self.evm_chain_id, exec_v2_activation: self.exec_v2_activation, forks: self.forks, base_hash: self.latest_block_hash }
     }
 
     /// Stores a proposal execution for apply_block (ignored there if the base moved on).
@@ -1264,7 +1340,7 @@ impl FullNode {
     /// match. Touches no node state, so it can run with no lock held.
     pub async fn execute_proposal(snap: ExecSnapshot, block: &Block) -> Result<(ExecutedBlock, Vec<crate::account::ExecutionReceipt>), String> {
         let mut sim = snap.csmt;
-        let ((sr, txr, rr), receipts) = StateTransitionEngine::validate_block_strict_with_receipts(&mut sim, block, snap.evm_chain_id, snap.exec_v2_activation).await?;
+        let ((sr, txr, rr), receipts) = StateTransitionEngine::validate_block_strict_with_forks(&mut sim, block, snap.evm_chain_id, snap.exec_v2_activation, snap.forks).await?;
         if sr != block.header.state_root {
             return Err(format!(
                 "state_root mismatch: calc 0x{} != claimed 0x{}",
@@ -1538,7 +1614,7 @@ impl FullNode {
             Some(e) => (e.csmt, e.roots),
             None => {
                 let mut sim_csmt = self.csmt.clone();
-                let roots = StateTransitionEngine::validate_block_strict(&mut sim_csmt, &block, self.evm_chain_id, self.exec_v2_activation).await?;
+                let roots = StateTransitionEngine::validate_block_strict_with_forks(&mut sim_csmt, &block, self.evm_chain_id, self.exec_v2_activation, self.forks()).await.map(|(roots, _)| roots)?;
                 (sim_csmt, roots)
             }
         };

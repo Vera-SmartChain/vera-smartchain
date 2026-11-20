@@ -569,8 +569,14 @@ impl RpcHandler {
                 }
             }
             "eth_gasPrice" => {
-                // 1 Gwei
-                Ok(serde_json::to_value("0x3b9aca00").unwrap())
+                // VIP-001: the minimum gas price of the next block (so wallets already quote
+                // the new price for the activation block); 1 gwei before activation.
+                let n = node.read().await;
+                let price = match crate::registry::effective_params(&n.csmt, n.height + 1, n.forks.registry) {
+                    Ok(Some(p)) => p.min_gas_price_wei,
+                    _ => 1_000_000_000,
+                };
+                Ok(serde_json::to_value(format!("0x{:x}", price)).unwrap())
             }
             "eth_estimateGas" => {
                 let params = req.params.as_array();
@@ -1420,7 +1426,9 @@ impl RpcHandler {
                     serde_json::json!({
                         "validatorAddress": format!("0x{}", hex::encode(u.validator_address)),
                         "amount": u.amount.to_string(),
-                        "releaseHeight": u.release_height
+                        "releaseHeight": u.release_height,
+                        "releaseTs": u.release_ts,
+                        "startHeight": u.start_height
                     })
                 }).collect();
 
@@ -1535,6 +1543,179 @@ impl RpcHandler {
                 match n.storage.load_block(height) {
                     Ok(Some(b)) => Ok(serde_json::to_value(b).unwrap()),
                     Ok(None) => Ok(Value::Null),
+                    Err(e) => Err(e),
+                }
+            }
+            "vera_registryParams" => {
+                let n = node.read().await;
+                // "active" = rules apply to the next block (stored, or it is the activation block).
+                match crate::registry::effective_params(&n.csmt, n.height + 1, n.forks.registry) {
+                    Ok(Some(p)) => Ok(serde_json::json!({
+                        "active": true,
+                        "activation_height": n.forks.registry,
+                        "min_gas_price_wei": p.min_gas_price_wei.to_string(),
+                        "fee_per_item_wei": p.fee_per_item_wei.to_string(),
+                        "last_gas_change_ts": p.last_gas_change_ts,
+                        "last_item_change_ts": p.last_item_change_ts,
+                        "max_batch_leaves": p.max_batch_leaves,
+                        "registrar": p.registrar.map(|a| hex::encode(a)),
+                        "registry_address": hex::encode(crate::registry::REGISTRY_SYSTEM_ADDRESS),
+                    })),
+                    Ok(None) => Ok(serde_json::json!({ "active": false, "activation_height": n.forks.registry })),
+                    Err(e) => Err(e),
+                }
+            }
+            "vera_rewardInfo" => {
+                // VIP-002: reward pool balance, emission schedule position and totals.
+                let n = node.read().await;
+                let pool = match n.csmt.get(&crate::rewards::REWARD_POOL_ADDRESS) {
+                    Some(b) => Account::from_bytes(b).map(|a| a.balance).unwrap_or(0),
+                    None => 0,
+                };
+                match crate::rewards::load_state(&n.csmt) {
+                    Ok(Some(st)) => Ok(serde_json::json!({
+                        "active": true,
+                        "activation_height": n.forks.rewards,
+                        "pool_address": hex::encode(crate::rewards::REWARD_POOL_ADDRESS),
+                        "pool_balance_wei": pool.to_string(),
+                        "emission_start_ts": st.start_ts,
+                        "last_ts": st.last_ts,
+                        "year": st.last_ts.saturating_sub(st.start_ts) / crate::rewards::SECONDS_PER_YEAR + 1,
+                        "rate_wei_per_sec": crate::rewards::rate_at(st.start_ts, st.last_ts).to_string(),
+                        "max_reward_gap_secs": crate::rewards::MAX_REWARD_GAP_SECS,
+                        "total_paid_wei": st.total_paid.to_string(),
+                    })),
+                    Ok(None) => Ok(serde_json::json!({
+                        "active": false,
+                        "activation_height": n.forks.rewards,
+                        "pool_address": hex::encode(crate::rewards::REWARD_POOL_ADDRESS),
+                        "pool_balance_wei": pool.to_string(),
+                    })),
+                    Err(e) => Err(e),
+                }
+            }
+            "vera_govInfo" => {
+                // VIP-003: governance state and the proposals still open or awaiting execution.
+                let n = node.read().await;
+                match crate::governance::load_state(&n.csmt) {
+                    Ok(Some(st)) => {
+                        let mut open = Vec::new();
+                        for id in &st.open {
+                            if let Ok(Some(p)) = crate::governance::load_proposal(&n.csmt, *id) {
+                                open.push(serde_json::to_value(&p).unwrap_or(Value::Null));
+                            }
+                        }
+                        Ok(serde_json::json!({
+                            "active": true,
+                            "activation_height": n.forks.governance,
+                            "governance_address": hex::encode(crate::governance::GOVERNANCE_SYSTEM_ADDRESS),
+                            "timing": st.timing,
+                            "next_id": st.next_id,
+                            "paused_until_ts": st.paused_until_ts,
+                            "last_key_pause_ts": st.last_key_pause_ts,
+                            "emergency_until_ts": st.emergency_until_ts,
+                            "key_allowlist": st.key_allowlist,
+                            "open_proposals": open,
+                        }))
+                    }
+                    Ok(None) => Ok(serde_json::json!({ "active": false, "activation_height": n.forks.governance })),
+                    Err(e) => Err(e),
+                }
+            }
+            "vera_openEntryInfo" => {
+                // VIP-004: entry queue, churn window, unbonding period, tombstoned keys.
+                let n = node.read().await;
+                match crate::open_staking::load_state(&n.csmt) {
+                    Ok(Some(st)) => {
+                        let vs = match n.csmt.get(&crate::account::VALIDATOR_SET_CSMT_KEY) {
+                            Some(b) => crate::consensus::ValidatorSet::from_bytes(b).unwrap_or_else(|_| n.validator_set.clone()),
+                            None => n.validator_set.clone(),
+                        };
+                        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                        Ok(serde_json::json!({
+                            "active": true,
+                            "activation_height": n.forks.open_entry,
+                            "evidence_address": hex::encode(crate::open_staking::EVIDENCE_SYSTEM_ADDRESS),
+                            "timing": st.timing,
+                            "min_validator_stake_wei": vs.min_validator_stake.to_string(),
+                            "max_active_validators": vs.max_active_validators,
+                            "churn_limit_wei": crate::open_staking::churn_limit(&vs).to_string(),
+                            "churn_used_wei": crate::open_staking::churn_used(&st, now).to_string(),
+                            "queue": st.queue.iter().map(|q| serde_json::json!({
+                                "address": hex::encode(q.address),
+                                "public_key": hex::encode(q.public_key),
+                                "amount_wei": q.amount.to_string(),
+                                "queued_ts": q.queued_ts,
+                            })).collect::<Vec<_>>(),
+                            "tombstoned": st.tombstoned.iter().map(hex::encode).collect::<Vec<_>>(),
+                            "offenders_in_window": st.offenders.iter().map(|o| serde_json::json!({
+                                "public_key": hex::encode(o.public_key),
+                                "offense_height": o.offense_height,
+                                "slashed_at_ts": o.slashed_at_ts,
+                                "base_stake_wei": o.base_stake.to_string(),
+                                "slashed_wei": o.slashed.to_string(),
+                            })).collect::<Vec<_>>(),
+                        }))
+                    }
+                    Ok(None) => Ok(serde_json::json!({ "active": false, "activation_height": n.forks.open_entry })),
+                    Err(e) => Err(e),
+                }
+            }
+            "vera_getProposal" => {
+                let id = req.params.as_array().and_then(|arr| arr.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
+                let n = node.read().await;
+                match crate::governance::load_proposal(&n.csmt, id) {
+                    Ok(Some(p)) => Ok(serde_json::to_value(&p).unwrap_or(Value::Null)),
+                    Ok(None) => Ok(Value::Null),
+                    Err(e) => Err(e),
+                }
+            }
+            "vera_getRecord" => {
+                // params: [registrant_address_hex, document_or_root_hash_hex]
+                let p = req.params.as_array();
+                let a = p.and_then(|arr| arr.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+                let h = p.and_then(|arr| arr.get(1)).and_then(|v| v.as_str()).unwrap_or("");
+                match (address_from_hex(a), address_from_hex(h)) {
+                    (Ok(registrant), Ok(doc_hash)) => {
+                        let n = node.read().await;
+                        let rec = crate::registry::load_doc(&n.csmt, &registrant, &doc_hash);
+                        let issuer = crate::registry::load_issuer(&n.csmt, &registrant);
+                        match (rec, issuer) {
+                            (Ok(Some(r)), Ok(iss)) => {
+                                let verified = iss.as_ref().filter(|i| i.covers(r.timestamp));
+                                Ok(serde_json::json!({
+                                    "kind": r.kind,
+                                    "leaf_count": r.leaf_count,
+                                    "parent": r.parent.map(|x| hex::encode(x)),
+                                    "height": r.height,
+                                    "timestamp": r.timestamp,
+                                    "revoked_at": r.revoked_at,
+                                    "issuer_verified": verified.is_some(),
+                                    "issuer_name": verified.map(|i| i.display_name.clone()),
+                                }))
+                            }
+                            (Ok(None), _) => Ok(Value::Null),
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                        }
+                    }
+                    (Err(e), _) | (_, Err(e)) => Err(e),
+                }
+            }
+            "vera_getIssuer" => {
+                let a = req.params.as_array().and_then(|arr| arr.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+                match address_from_hex(a) {
+                    Ok(addr) => {
+                        let n = node.read().await;
+                        match crate::registry::load_issuer(&n.csmt, &addr) {
+                            Ok(Some(i)) => Ok(serde_json::json!({
+                                "issuer_id": hex::encode(i.issuer_id),
+                                "display_name": i.display_name,
+                                "windows": i.windows.iter().map(|(f, u)| serde_json::json!({ "valid_from_ts": f, "valid_until_ts": u })).collect::<Vec<_>>(),
+                            })),
+                            Ok(None) => Ok(Value::Null),
+                            Err(e) => Err(e),
+                        }
+                    }
                     Err(e) => Err(e),
                 }
             }

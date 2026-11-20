@@ -383,7 +383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(to_addr),
                 amount,
                 25_000,
-                1,
+                resolve_gas_price(&client, &rpc_url).await?,
                 vec![],
             );
 
@@ -454,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(vera_blockchain::account::STAKING_SYSTEM_ADDRESS),
                 amount,
                 30_000,
-                1,
+                resolve_gas_price(&client, &rpc_url).await?,
                 b"stake".to_vec(),
             );
 
@@ -494,7 +494,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(vera_blockchain::account::STAKING_SYSTEM_ADDRESS),
                 amount,
                 30_000,
-                1,
+                resolve_gas_price(&client, &rpc_url).await?,
                 b"unstake".to_vec(),
             );
 
@@ -528,7 +528,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(vera_blockchain::account::STAKING_SYSTEM_ADDRESS),
                 0,
                 30_000,
-                1,
+                resolve_gas_price(&client, &rpc_url).await?,
                 b"unjail".to_vec(),
             );
 
@@ -569,7 +569,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(vera_blockchain::account::STAKING_SYSTEM_ADDRESS),
                 0,
                 30_000,
-                1,
+                resolve_gas_price(&client, &rpc_url).await?,
                 payload_data,
             );
 
@@ -610,7 +610,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(vera_blockchain::account::STAKING_SYSTEM_ADDRESS),
                 0,
                 30_000,
-                1,
+                resolve_gas_price(&client, &rpc_url).await?,
                 payload_data,
             );
 
@@ -651,7 +651,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(vera_blockchain::account::STAKING_SYSTEM_ADDRESS),
                 0,
                 30_000,
-                1,
+                resolve_gas_price(&client, &rpc_url).await?,
                 payload_data,
             );
 
@@ -970,7 +970,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(vera_blockchain::account::STAKING_SYSTEM_ADDRESS),
                 0,
                 30_000,
-                1,
+                resolve_gas_price(&client, &rpc_url).await?,
                 allow_payload,
             );
             let allow_raw = format!("0x{}", hex::encode(allow_tx.to_bytes()));
@@ -1006,7 +1006,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(val_addr),
                     funding_amount,
                     25_000,
-                    1,
+                    resolve_gas_price(&client, &rpc_url).await?,
                     vec![],
                 );
                 let fund_raw = format!("0x{}", hex::encode(fund_tx.to_bytes()));
@@ -1060,9 +1060,199 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Proceed to Step 7 (enable validator service) and Step 8 (stake 32 VERA).");
             println!("--------------------------------------------------------------------------------");
         }
+        "registry" => {
+            // VIP-001 document registry operations, sent to REGISTRY_SYSTEM_ADDRESS.
+            use vera_blockchain::registry::{IssuerRecord, RegistryOp, REGISTRY_SYSTEM_ADDRESS};
+            const REGISTRY_USAGE: &str = "Usage: vera_cli registry [--key-file <path> | <priv_hex>] <op> <args...>
+                  register <kind> <doc_hash_hex> [parent_hash_hex]
+                  batch <kind> <merkle_root_hex> <leaf_count>
+                  revoke <doc_hash_hex>
+                  set-fee <fee_per_item_wei>          (governance)
+                  set-gas-price <min_gas_price_wei>   (governance)
+                  set-registrar <address_hex>         (governance)
+                  set-issuer <address_hex> <issuer_id_hex> <valid_from_ts> <valid_until_ts> <name>   (registrar)
+                  remove-issuer <address_hex>         (registrar)";
+            if args.len() < 4 {
+                eprintln!("{}", REGISTRY_USAGE);
+                return Ok(());
+            }
+            let (signing_key, rem) = parse_key_and_remaining_args(&args[2..])?;
+            let need = |n: usize| -> Result<(), Box<dyn std::error::Error>> {
+                if rem.len() < n { Err(REGISTRY_USAGE.into()) } else { Ok(()) }
+            };
+            need(1)?;
+            let op = match rem[0].as_str() {
+                "register" => {
+                    need(3)?;
+                    let parent = match rem.get(3) { Some(h) => Some(hash32_from_hex(h)?), None => None };
+                    RegistryOp::Register { kind: rem[1].parse()?, doc_hash: hash32_from_hex(&rem[2])?, parent }
+                }
+                "batch" => {
+                    need(4)?;
+                    RegistryOp::RegisterBatch { kind: rem[1].parse()?, merkle_root: hash32_from_hex(&rem[2])?, leaf_count: rem[3].parse()? }
+                }
+                "revoke" => { need(2)?; RegistryOp::Revoke { doc_hash: hash32_from_hex(&rem[1])? } }
+                "set-fee" => { need(2)?; RegistryOp::SetFee { fee_per_item_wei: rem[1].parse()? } }
+                "set-gas-price" => { need(2)?; RegistryOp::SetGasPrice { min_gas_price_wei: rem[1].parse()? } }
+                "set-registrar" => { need(2)?; RegistryOp::SetRegistrar { addr: address_from_hex(&rem[1])? } }
+                "remove-issuer" => { need(2)?; RegistryOp::RemoveIssuer { addr: address_from_hex(&rem[1])? } }
+                "set-issuer" => {
+                    need(6)?;
+                    RegistryOp::SetIssuer {
+                        addr: address_from_hex(&rem[1])?,
+                        record: IssuerRecord {
+                            issuer_id: hash32_from_hex(&rem[2])?,
+                            valid_from_ts: rem[3].parse()?,
+                            valid_until_ts: rem[4].parse()?,
+                            display_name: rem[5..].join(" "),
+                        },
+                    }
+                }
+                other => {
+                    eprintln!("Unknown registry op '{}'.
+{}", other, REGISTRY_USAGE);
+                    std::process::exit(1);
+                }
+            };
+
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, None).await?;
+            let tx = Transaction::new(
+                "vera-testnet-1",
+                &signing_key,
+                nonce,
+                Some(REGISTRY_SYSTEM_ADDRESS),
+                0,
+                30_000,
+                resolve_gas_price(&client, &rpc_url).await?,
+                op.encode(),
+            );
+            let payload = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "vera_sendRawTransaction",
+                "params": [format!("0x{}", hex::encode(tx.to_bytes()))]
+            });
+            let res = client.post(&rpc_url).json(&payload).send().await?;
+            let json_res: serde_json::Value = res.json().await?;
+            handle_rpc_tx_response(&json_res, "Registry transaction broadcast.")?;
+        }
+        "gov" => {
+            // VIP-003 governance operations, sent to GOVERNANCE_SYSTEM_ADDRESS.
+            use vera_blockchain::governance::{GovAction, GovOp, GOVERNANCE_SYSTEM_ADDRESS};
+            const GOV_USAGE: &str = "Usage: vera_cli gov [--key-file <path> | <priv_hex>] <op> <args...>\n  \
+                propose '<action json>' <voting_period_secs>   (active validator)\n  \
+                vote <proposal_id> yes|no                      (validator in the snapshot)\n  \
+                cancel <proposal_id>                           (proposer, before any vote)\n  \
+                pause <seconds>                                (governance key, emergency, <= 72 h)\n  \
+                unpause                                        (governance key)\n\
+              Action JSON examples: '{\"SetFee\":{\"fee_per_item_wei\":60000000000000000}}'\n  \
+                '{\"Allow\":{\"address\":[...32 bytes...]}}'  '\"Unpause\"'  '\"EndEmergencyPower\"'";
+            if args.len() < 4 {
+                eprintln!("{}", GOV_USAGE);
+                return Ok(());
+            }
+            let (signing_key, rem) = parse_key_and_remaining_args(&args[2..])?;
+            let need = |n: usize| -> Result<(), Box<dyn std::error::Error>> {
+                if rem.len() < n { Err(GOV_USAGE.into()) } else { Ok(()) }
+            };
+            need(1)?;
+            let op = match rem[0].as_str() {
+                "propose" => {
+                    need(3)?;
+                    let action: GovAction = serde_json::from_str(&rem[1]).map_err(|e| format!("invalid action JSON: {}", e))?;
+                    GovOp::Propose { action, voting_period_secs: rem[2].parse()? }
+                }
+                "vote" => {
+                    need(3)?;
+                    let yes = match rem[2].as_str() { "yes" => true, "no" => false, _ => return Err(GOV_USAGE.into()) };
+                    GovOp::Vote { id: rem[1].parse()?, yes }
+                }
+                "cancel" => { need(2)?; GovOp::Cancel { id: rem[1].parse()? } }
+                "pause" => { need(2)?; GovOp::PauseRegistry { duration_secs: rem[1].parse()? } }
+                "unpause" => GovOp::Unpause,
+                other => {
+                    eprintln!("Unknown gov op '{}'.\n{}", other, GOV_USAGE);
+                    std::process::exit(1);
+                }
+            };
+            let program = op.encode();
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, None).await?;
+            let tx = Transaction::new(
+                "vera-testnet-1",
+                &signing_key,
+                nonce,
+                Some(GOVERNANCE_SYSTEM_ADDRESS),
+                0,
+                21_000 + 10 * program.len() as u64 + 5_000,
+                resolve_gas_price(&client, &rpc_url).await?,
+                program,
+            );
+            let payload = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "vera_sendRawTransaction",
+                "params": [format!("0x{}", hex::encode(tx.to_bytes()))]
+            });
+            let res = client.post(&rpc_url).json(&payload).send().await?;
+            let json_res: serde_json::Value = res.json().await?;
+            handle_rpc_tx_response(&json_res, "Governance transaction broadcast.")?;
+        }
+        "evidence" => {
+            // VIP-004: equivocation evidence, sent to EVIDENCE_SYSTEM_ADDRESS by any account.
+            use vera_blockchain::consensus::{Vote, VoteType};
+            use vera_blockchain::open_staking::{Evidence, EVIDENCE_SYSTEM_ADDRESS};
+            const EV_USAGE: &str = "Usage: vera_cli evidence [--key-file <path> | <priv_hex>] <op> <args...>
+                  submit <evidence.json>          (any account; JSON of DuplicateVote or DuplicateProposal)
+                  self-test <height> --devnet     (DEVNET ONLY: signs two conflicting prevotes with YOUR key and
+                                                   submits them; that key is slashed and tombstoned forever)";
+            if args.len() < 4 {
+                eprintln!("{}", EV_USAGE);
+                return Ok(());
+            }
+            let (signing_key, rem) = parse_key_and_remaining_args(&args[2..])?;
+            let ev: Evidence = match rem.first().map(|s| s.as_str()) {
+                Some("submit") if rem.len() >= 2 => serde_json::from_str(&std::fs::read_to_string(&rem[1])?)
+                    .map_err(|e| format!("invalid evidence JSON: {}", e))?,
+                Some("self-test") if rem.len() >= 3 && rem.iter().any(|a| a == "--devnet") => {
+                    let h: u64 = rem[1].parse()?;
+                    Evidence::DuplicateVote {
+                        a: Vote::new("vera-testnet-1", h, 0, [1u8; 32], VoteType::PreVote, &signing_key),
+                        b: Vote::new("vera-testnet-1", h, 0, [2u8; 32], VoteType::PreVote, &signing_key),
+                    }
+                }
+                _ => {
+                    eprintln!("{}", EV_USAGE);
+                    std::process::exit(1);
+                }
+            };
+            let program = ev.encode();
+            let client = reqwest::Client::new();
+            let nonce = resolve_nonce(&client, &rpc_url, &signing_key, None).await?;
+            let tx = Transaction::new(
+                "vera-testnet-1",
+                &signing_key,
+                nonce,
+                Some(EVIDENCE_SYSTEM_ADDRESS),
+                0,
+                21_000 + 10 * program.len() as u64 + 5_000,
+                resolve_gas_price(&client, &rpc_url).await?,
+                program,
+            );
+            let payload = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "vera_sendRawTransaction",
+                "params": [format!("0x{}", hex::encode(tx.to_bytes()))]
+            });
+            let res = client.post(&rpc_url).json(&payload).send().await?;
+            let json_res: serde_json::Value = res.json().await?;
+            handle_rpc_tx_response(&json_res, "Evidence transaction broadcast.")?;
+        }
         "signraw" => {
             if args.len() < 7 {
-                eprintln!("Usage: vera_cli signraw <priv_hex> <dest_hex> <amount_wei> <start_nonce> <count>");
+                eprintln!("Usage: vera_cli signraw <priv_hex> <dest_hex> <amount_wei> <start_nonce> <count> [gas_price_wei]");
                 return Ok(());
             }
             let priv_hex = args[2].strip_prefix("0x").unwrap_or(&args[2]);
@@ -1070,6 +1260,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let amount: u128 = args[4].parse()?;
             let start_nonce: u64 = args[5].parse()?;
             let count: u64 = args[6].parse()?;
+            // Offline signing cannot ask the node, so the caller passes the gas price.
+            // From VIP-001 activation on, the node rejects anything below its minimum.
+            let gas_price: u64 = match args.get(7) {
+                Some(v) => v.parse()?,
+                None => 1,
+            };
 
             let priv_bytes = hex::decode(priv_hex)?;
             let mut key_bytes = [0u8; 32];
@@ -1086,7 +1282,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(to_addr),
                     amount,
                     25_000,
-                    1,
+                    gas_price,
                     vec![],
                 );
                 batch.push(format!("0x{}", hex::encode(tx.to_bytes())));
@@ -1177,12 +1373,24 @@ fn print_usage() {
     println!("  vera_cli disallow [--key-file <path> | <gov_priv_hex>] <val_addr_hex> [nonce]");
     println!("  vera_cli set_governance [--key-file <path> | <gov_priv_hex>] <new_gov_addr_hex> [nonce]");
     println!("  vera_cli validators");
-    println!("  vera_cli signraw <priv_hex> <dest_hex> <amount_wei> <start_nonce> <count>");
+    println!("  vera_cli registry [--key-file <path> | <priv_hex>] <register|batch|revoke|set-fee|set-gas-price|set-registrar|set-issuer|remove-issuer> ...");
+    println!("  vera_cli gov [--key-file <path> | <priv_hex>] <propose|vote|cancel|pause|unpause> ...");
+    println!("  vera_cli signraw <priv_hex> <dest_hex> <amount_wei> <start_nonce> <count> [gas_price_wei]");
     println!("  vera_cli assemble <source.json> <dest.json>");
     println!("  vera_cli disassemble <binary.vbc>");
     println!("  vera_cli genesis [dest.json]");
 }
 
+
+fn hash32_from_hex(s: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))?;
+    if bytes.len() != 32 {
+        return Err(format!("expected 32 bytes of hex, got {}", bytes.len()).into());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
 
 fn handle_rpc_tx_response(json_res: &serde_json::Value, success_msg: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(err) = json_res.get("error") {
@@ -1197,6 +1405,25 @@ fn handle_rpc_tx_response(json_res: &serde_json::Value, success_msg: &str) -> Re
         println!("TX Hash: {}", json_res["result"]);
     }
     Ok(())
+}
+
+/// Gas price for native transactions: the node's `eth_gasPrice`.
+/// After VIP-001 activation the node rejects any transaction below the on-chain minimum,
+/// so a hard-coded price would stop working when governance changes it.
+async fn resolve_gas_price(
+    client: &reqwest::Client,
+    rpc_url: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let payload = json!({"jsonrpc": "2.0", "id": 1, "method": "eth_gasPrice", "params": []});
+    let res = client.post(rpc_url).json(&payload).send().await
+        .map_err(|e| format!("Failed to connect to RPC ({}) to query gas price: {}", rpc_url, e))?;
+    let json: serde_json::Value = res.json().await
+        .map_err(|e| format!("Failed to parse RPC response: {}", e))?;
+    let hex_str = json["result"].as_str()
+        .ok_or_else(|| format!("eth_gasPrice returned no result: {}", json))?;
+    let price = u64::from_str_radix(hex_str.trim_start_matches("0x"), 16)
+        .map_err(|e| format!("Invalid eth_gasPrice value '{}': {}", hex_str, e))?;
+    Ok(price.max(1))
 }
 
 async fn resolve_nonce(

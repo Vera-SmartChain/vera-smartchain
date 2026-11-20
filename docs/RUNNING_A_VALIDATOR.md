@@ -185,6 +185,25 @@ Expected output:
 TX Hash: "0x..."
 ```
 
+### Key Safety: Never Sign Twice
+A validator key must sign at most one message per height, round and step. The node enforces
+this by writing every signature to its write-ahead log (the `tm_wal/` folder inside the node's
+data directory) and syncing it to disk before the message leaves the node. Two rules keep that
+protection intact:
+
+- **Never run the same validator key on two nodes at the same time**, not even as a "hot
+  backup". The two nodes do not share a log, so they can sign two different blocks.
+- **Never restore the key on a new disk without its `tm_wal/` folder.** Move both together, and
+  start the new node only after the old one is stopped for good.
+
+Once open validator entry (VIP-004) is active on a network, two conflicting signatures are
+proof of equivocation: anyone can submit them, the key loses 5% of its stake at risk (all of
+it if the keys slashed within one unbonding period reach 1/3 of the active stake), leaves the
+active set, and is banned forever.
+
+Stake, unstake and unjail must be sent with `vera_cli` (a native ed25519 transaction signed by
+the validator key). Transactions sent from an EVM wallet such as MetaMask cannot stake.
+
 ### Voluntary Exit (Unstaking)
 To unbond your stake and exit the validator set:
 ```bash

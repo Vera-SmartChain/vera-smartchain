@@ -142,6 +142,8 @@ pub struct TmDriver {
     timing: HeightTiming,
     /// Compact proposal waiting for the txs we asked its sender for.
     pending_compact: Option<(TmCompactProposal, std::net::SocketAddr)>,
+    /// VIP-004: conflicting messages signed by one key at the current height.
+    equivocations: crate::open_staking::EquivocationTracker,
 }
 
 impl TmDriver {
@@ -173,6 +175,7 @@ impl TmDriver {
             replay_future: false,
             timing: HeightTiming::default(),
             pending_compact: None,
+            equivocations: Default::default(),
         })
     }
 
@@ -349,6 +352,24 @@ impl TmDriver {
             let r = message_round(&msg);
             if r > sm.round() + MAX_ROUND_AHEAD {
                 return;
+            }
+        }
+        // VIP-004: a key that signed two different messages for one round and step is
+        // reported on-chain (refused by the node before activation).
+        let evidence = match &msg {
+            P2PPayload::TmVote(v) => self.equivocations.on_vote(v),
+            P2PPayload::TmProposal(p) => self.equivocations.on_proposal(crate::open_staking::SignedProposal::from_tm(p)),
+            _ => None,
+        };
+        if let Some(ev) = evidence {
+            let who = hex::encode(&ev.offender()[..4]);
+            match node.write().await.submit_evidence(&ev) {
+                Ok(tx) => eprintln!("⚖️ [TM] Equivocation by 0x{}… at #{}: evidence submitted (tx 0x{}…)", who, ev.height(), hex::encode(&tx[..4])),
+                Err(e) => {
+                    // Not lost: the next conflicting message from this key returns it again.
+                    self.equivocations.forget(&ev.offender());
+                    eprintln!("⚠️ [TM] Equivocation by 0x{}… at #{}: evidence not submitted: {}", who, ev.height(), e);
+                }
             }
         }
         // Relay what we accept (reliable gossip), then feed the engine. A proposal rebuilt

@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey, Verifier};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use crate::account::Address;
@@ -19,6 +19,18 @@ pub struct UnbondingEntry {
     pub validator_address: Address,
     pub amount: u128,
     pub release_height: u64,
+    /// VIP-004: released at this timestamp instead of `release_height`. The VIP-004 fields
+    /// are omitted from the encoding when absent, so entries made before VIP-004 keep their
+    /// bytes (and every state root stays the same).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_ts: Option<u64>,
+    /// VIP-004: height of the block that started the unbonding. The stake still answers for
+    /// equivocation at heights up to this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_height: Option<u64>,
+    /// VIP-004: validator key that bonded this stake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,13 +94,29 @@ impl Vote {
         hasher.finalize()
     }
 
+    /// Strict Ed25519 (RFC 8032): rejects weak (small-order) keys, for which a signature can
+    /// be forged without the private key. Honest signatures always pass.
     pub fn verify(&self) -> Result<(), String> {
         let vk = VerifyingKey::from_bytes(&self.validator_pubkey)
             .map_err(|e| format!("Invalid validator public key: {}", e))?;
         let sig = Signature::from_bytes(&self.signature);
         let hash = self.signing_hash();
-        vk.verify(&hash, &sig)
+        vk.verify_strict(&hash, &sig)
             .map_err(|e| format!("Vote has invalid signature: {}", e))
+    }
+}
+
+/// A stake, unstake or unjail must come from a native ed25519 transaction with a strong key.
+/// An EVM-wrapped transaction carries `public_key = [0; 32]` (a weak, small-order point):
+/// stake from several wallets would pool on that one key, anyone could unstake it, and votes
+/// for it could be forged.
+pub fn check_staking_key(is_evm: bool, public_key: &[u8; 32]) -> Result<(), String> {
+    if is_evm || *public_key == [0u8; 32] {
+        return Err("Staking requires a native ed25519 transaction (EVM-wrapped transactions cannot stake)".to_string());
+    }
+    match VerifyingKey::from_bytes(public_key) {
+        Ok(vk) if !vk.is_weak() => Ok(()),
+        _ => Err("Staking requires a valid, non-weak ed25519 validator key".to_string()),
     }
 }
 
@@ -224,6 +252,7 @@ impl ValidatorSet {
 
     /// Dynamically adds or increments validator stake at runtime
     pub fn bond(&mut self, address: Address, public_key: [u8; 32], amount: u128) -> Result<(), String> {
+        check_staking_key(false, &public_key)?;
         if self.permissioned_validators && !self.is_allowed(&address) {
             return Err(format!(
                 "Address 0x{} not authorized in validator allowlist",
@@ -298,18 +327,25 @@ impl ValidatorSet {
             validator_address: val_addr,
             amount: actual_amount,
             release_height,
+            release_ts: None,
+            start_height: None,
+            public_key: None,
         });
 
         Ok(actual_amount)
     }
 
-    /// Releases matured unbondings whose release height has been reached
-    pub fn process_maturing_unbondings(&mut self, current_height: u64) -> Vec<(Address, u128)> {
+    /// Releases matured unbondings: by timestamp for VIP-004 entries, by height otherwise.
+    pub fn process_maturing_unbondings(&mut self, current_height: u64, current_ts: u64) -> Vec<(Address, u128)> {
         let mut maturing = Vec::new();
         let mut remaining = Vec::new();
 
         for entry in self.unbonding_queue.drain(..) {
-            if entry.release_height <= current_height {
+            let due = match entry.release_ts {
+                Some(ts) => ts <= current_ts,
+                None => entry.release_height <= current_height,
+            };
+            if due {
                 maturing.push((entry.validator_address, entry.amount));
             } else {
                 remaining.push(entry);
@@ -460,6 +496,23 @@ impl ValidatorSet {
         }
     }
 
+    /// VIP-004 liveness audit: only validators in the active set can miss a block. Bonded
+    /// validators outside it (displaced from the top N, or still entering through the churn
+    /// queue below the minimum) cannot sign, so their counter stays at zero.
+    pub fn audit_liveness_active(&mut self, signers: &HashSet<[u8; 32]>) {
+        let active: HashSet<[u8; 32]> = self.active_validators().iter().map(|v| v.public_key).collect();
+        for val in &mut self.validators {
+            if val.is_jailed {
+                continue;
+            }
+            if signers.contains(&val.public_key) || !active.contains(&val.public_key) {
+                val.missed_blocks = 0;
+            } else {
+                val.missed_blocks = val.missed_blocks.saturating_add(1);
+            }
+        }
+    }
+
     /// Applies penalty (Inactivity Slashing) to validators exceeding max_missed_blocks.
     /// Slashes 1% of stake, sends validator to JAIL, and resets missed blocks counter.
     pub fn slash_inactive_validators(&mut self) -> Vec<(Address, u128)> {
@@ -541,7 +594,7 @@ mod tests {
 
         // Bond
         let addr1 = [1u8; 32];
-        let pub1 = [11u8; 32];
+        let pub1 = SigningKey::from_bytes(&[11u8; 32]).verifying_key().to_bytes();
         val_set.bond(addr1, pub1, 500).unwrap();
         assert_eq!(val_set.validators.len(), 1);
         assert_eq!(val_set.total_stake(), 500);
@@ -553,7 +606,7 @@ mod tests {
 
         // Second validator
         let addr2 = [2u8; 32];
-        let pub2 = [22u8; 32];
+        let pub2 = SigningKey::from_bytes(&[22u8; 32]).verifying_key().to_bytes();
         val_set.bond(addr2, pub2, 200).unwrap();
         assert_eq!(val_set.validators.len(), 2);
         assert_eq!(val_set.total_stake(), 1000);
@@ -569,7 +622,7 @@ mod tests {
         assert_eq!(val_set.total_stake(), 200);
 
         // Process maturing
-        let matured = val_set.process_maturing_unbondings(10);
+        let matured = val_set.process_maturing_unbondings(10, 0);
         assert_eq!(matured.len(), 2);
         assert_eq!(matured[0].1 + matured[1].1, 800);
     }
