@@ -52,7 +52,7 @@ This document describes the parameters and cryptographic state of the **VERA Sma
 
 ## 📡 Public RPC & P2P Seeds
 
-- **HTTP JSON-RPC:** `https://testnet-rpc.verachain.cloud` (or `http://2.25.216.206:8545`)
+- **HTTP JSON-RPC:** `https://testnet-rpc.verachain.cloud`
 - **Block Explorer:** `https://testnet-explorer.verachain.cloud`
 - **P2P Seed Nodes:**
   - `2.25.216.206:26656` (Node 1)

@@ -51,12 +51,13 @@ Leap status     : Normal
 Download the release bundle, verify cryptographic signatures, and run the automated installer:
 ```bash
 mkdir -p ~/vera-testnet && cd ~/vera-testnet
-RELEASE_URL="https://github.com/Vera-SmartChain/vera-node-releases/releases/download/v0.2.8.1-testnet"
-for f in install.sh SHA256SUMS SHA256SUMS.sig vera-release.pub testnet-genesis.json vera_node vera_cli vera-node.service vera-validator.service; do
+VER=v0.3.0-testnet   # use the latest release: https://github.com/Vera-SmartChain/vera-node-releases/releases/latest
+RELEASE_URL="https://github.com/Vera-SmartChain/vera-node-releases/releases/download/${VER}"
+for f in install.sh RELEASE.json SHA256SUMS SHA256SUMS.sig testnet-genesis.json vera-join.sh vera-node.service vera-release.pub vera-validator.service vera_cli vera_node; do
     wget -q --show-progress "${RELEASE_URL}/${f}"
 done
 gpg --import vera-release.pub
-gpg --verify SHA256SUMS.sig SHA256SUMS
+gpg --status-fd 1 --verify SHA256SUMS.sig SHA256SUMS | grep "VALIDSIG 37F39BD89ADEE9EEE5549C38897419EFF806BE51 "   # must print a line
 sha256sum -c SHA256SUMS
 chmod +x install.sh && sudo ./install.sh
 sudo systemctl enable --now vera-node
