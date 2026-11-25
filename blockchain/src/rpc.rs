@@ -1,6 +1,9 @@
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tiny_keccak::{Hasher, Keccak};
+use tokio::sync::Semaphore;
 use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
 
 use crate::account::{Account, Address, address_from_hex};
@@ -408,6 +411,43 @@ pub fn parse_and_recover_evm_tx(raw: &[u8], expected_chain_id: u64) -> Result<Re
     Err("Incompatible RLP transaction format".to_string())
 }
 
+
+/// Limits for requests that read many block files. One such request must not stall the node.
+const SCAN_BUDGET: Duration = Duration::from_secs(3);
+const MAX_LOG_RESULTS: usize = 10_000;
+const MAX_RECENT_BLOCKS: usize = 100;
+/// Scans up to this many blocks share a small pool; larger ones run one at a time.
+const SMALL_SCAN_BLOCKS: u64 = 32; // covers the explorer asking for 25 recent blocks
+const SMALL_SCAN_WAIT: Duration = Duration::from_secs(1);
+static SMALL_SCANS: Semaphore = Semaphore::const_new(4);
+static LARGE_SCANS: Semaphore = Semaphore::const_new(1);
+
+/// JSON-RPC "limit exceeded" (EIP-1474).
+fn limit_error(message: String) -> RpcError {
+    RpcError { code: -32005, message, data: None }
+}
+
+/// Runs a block-reading job on a blocking thread, with bounded concurrency.
+async fn run_scan<T, F>(blocks: u64, job: F) -> Result<T, RpcError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RpcError> + Send + 'static,
+{
+    let permit = if blocks <= SMALL_SCAN_BLOCKS {
+        tokio::time::timeout(SMALL_SCAN_WAIT, SMALL_SCANS.acquire()).await.ok().and_then(Result::ok)
+    } else {
+        LARGE_SCANS.try_acquire().ok()
+    };
+    let Some(permit) = permit else {
+        return Err(limit_error("node is busy with other block queries: retry shortly or use a smaller block range".to_string()));
+    };
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit; // held until the job ends, even if the client goes away
+        job()
+    })
+    .await
+    .map_err(|e| RpcError { code: -32603, message: format!("block query failed: {}", e), data: None })?
+}
 
 pub struct RpcHandler;
 
@@ -837,16 +877,10 @@ impl RpcHandler {
                             if target_arr == n.latest_block_hash {
                                 n.storage.load_block(latest_height).ok().flatten()
                             } else {
-                                let mut found = None;
-                                for h in (1..=latest_height).rev() {
-                                    if let Ok(Some(b)) = n.storage.load_block(h) {
-                                        if b.hash() == target_arr {
-                                            found = Some(b);
-                                            break;
-                                        }
-                                    }
-                                }
-                                found
+                                // Genesis keeps answering null by hash, as before.
+                                n.storage
+                                    .load_block_by_hash(&target_arr)
+                                    .filter(|b| (1..=latest_height).contains(&b.header.height))
                             }
                         } else { None }
                     } else { None }
@@ -1236,15 +1270,10 @@ impl RpcHandler {
                         if target_hash.len() == 32 {
                             let mut target_arr = [0u8; 32];
                             target_arr.copy_from_slice(&target_hash);
-                            let mut found_h = None;
-                            for h in (0..=latest_height).rev() {
-                                if let Ok(Some(b)) = storage.load_block(h) {
-                                    if b.hash() == target_arr {
-                                        found_h = Some(h);
-                                        break;
-                                    }
-                                }
-                            }
+                            let found_h = storage
+                                .load_block_by_hash(&target_arr)
+                                .map(|b| b.header.height)
+                                .filter(|h| *h <= latest_height);
                             if let Some(h) = found_h {
                                 (h, h)
                             } else {
@@ -1344,58 +1373,75 @@ impl RpcHandler {
                     None => Vec::new(),
                 };
 
-                let mut matched_logs = Vec::new();
-                let mut log_idx_counter = 0usize;
+                // Reading block files is synchronous: it must never run on the async workers.
+                let scan = run_scan(to_clamped - from_clamped + 1, move || {
+                    let started = std::time::Instant::now();
+                    let mut matched_logs = Vec::new();
+                    let mut log_idx_counter = 0usize;
 
-                for h in from_clamped..=to_clamped {
-                    if let Ok(Some(block)) = storage.load_block(h) {
-                        let b_hash = format!("0x{}", hex::encode(block.hash()));
-                        for (tx_idx, receipt) in block.receipts.iter().enumerate() {
-                            let tx_hash = block.transactions.get(tx_idx).map(|t| format!("0x{}", hex::encode(t.tx_hash()))).unwrap_or_default();
-                            for log in &receipt.logs {
-                                let log_addr_hex = hex::encode(&log.address[12..32]).to_lowercase();
-                                if let Some(ref set) = address_filter {
-                                    if !set.contains(&log_addr_hex) {
-                                        continue;
+                    for h in from_clamped..=to_clamped {
+                        if started.elapsed() > SCAN_BUDGET {
+                            return Err(limit_error("query takes too long: use a smaller block range".to_string()));
+                        }
+                        if let Ok(Some(block)) = storage.load_block(h) {
+                            let b_hash = format!("0x{}", hex::encode(block.hash()));
+                            for (tx_idx, receipt) in block.receipts.iter().enumerate() {
+                                let tx_hash = block.transactions.get(tx_idx).map(|t| format!("0x{}", hex::encode(t.tx_hash()))).unwrap_or_default();
+                                for log in &receipt.logs {
+                                    let log_addr_hex = hex::encode(&log.address[12..32]).to_lowercase();
+                                    if let Some(ref set) = address_filter {
+                                        if !set.contains(&log_addr_hex) {
+                                            continue;
+                                        }
                                     }
-                                }
 
-                                let mut topic_match = true;
-                                for (t_idx, filter_matcher) in topics_filter.iter().enumerate() {
-                                    if let Some(matcher_list) = filter_matcher {
-                                        if let Some(actual_topic) = log.topics.get(t_idx) {
-                                            let actual_topic_hex = hex::encode(actual_topic).to_lowercase();
-                                            if !matcher_list.iter().any(|m| m == &actual_topic_hex) {
+                                    let mut topic_match = true;
+                                    for (t_idx, filter_matcher) in topics_filter.iter().enumerate() {
+                                        if let Some(matcher_list) = filter_matcher {
+                                            if let Some(actual_topic) = log.topics.get(t_idx) {
+                                                let actual_topic_hex = hex::encode(actual_topic).to_lowercase();
+                                                if !matcher_list.iter().any(|m| m == &actual_topic_hex) {
+                                                    topic_match = false;
+                                                    break;
+                                                }
+                                            } else {
                                                 topic_match = false;
                                                 break;
                                             }
-                                        } else {
-                                            topic_match = false;
-                                            break;
                                         }
                                     }
-                                }
 
-                                if topic_match {
-                                    matched_logs.push(serde_json::json!({
-                                        "address": format!("0x{}", log_addr_hex),
-                                        "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
-                                        "data": format!("0x{}", hex::encode(&log.data)),
-                                        "blockNumber": format!("0x{:x}", h),
-                                        "transactionHash": tx_hash,
-                                        "transactionIndex": format!("0x{:x}", tx_idx),
-                                        "blockHash": b_hash,
-                                        "logIndex": format!("0x{:x}", log_idx_counter),
-                                        "removed": false
-                                    }));
-                                    log_idx_counter += 1;
+                                    if topic_match {
+                                        if matched_logs.len() >= MAX_LOG_RESULTS {
+                                            return Err(limit_error(format!("query matches more than {} logs: use a smaller block range or a narrower filter", MAX_LOG_RESULTS)));
+                                        }
+                                        matched_logs.push(serde_json::json!({
+                                            "address": format!("0x{}", log_addr_hex),
+                                            "topics": log.topics.iter().map(|t| format!("0x{}", hex::encode(t))).collect::<Vec<_>>(),
+                                            "data": format!("0x{}", hex::encode(&log.data)),
+                                            "blockNumber": format!("0x{:x}", h),
+                                            "transactionHash": tx_hash,
+                                            "transactionIndex": format!("0x{:x}", tx_idx),
+                                            "blockHash": b_hash,
+                                            "logIndex": format!("0x{:x}", log_idx_counter),
+                                            "removed": false
+                                        }));
+                                        log_idx_counter += 1;
+                                    }
                                 }
                             }
                         }
                     }
-                }
+                    Ok(matched_logs)
+                })
+                .await;
 
-                Ok(serde_json::to_value(matched_logs).unwrap())
+                match scan {
+                    Ok(matched_logs) => Ok(serde_json::to_value(matched_logs).unwrap()),
+                    Err(error) => {
+                        return RpcResponse { jsonrpc: "2.0".to_string(), id: req.id, result: None, error: Some(error) };
+                    }
+                }
             }
 
             // ==================== VERA NATIVE METHODS ====================
@@ -1465,7 +1511,8 @@ impl RpcHandler {
                 let limit = req.params.as_array()
                     .and_then(|arr| arr.get(0))
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(10) as usize;
+                    .unwrap_or(10)
+                    .min(MAX_RECENT_BLOCKS as u64) as usize;
                 let n = node.read().await;
                 let now_ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1478,56 +1525,71 @@ impl RpcHandler {
                 let proposer_hex = format!("0x{}", hex::encode(n.address));
                 // Real network restart milestone: September 27, 2026 at 14:43:53 UTC
                 let network_restart_ts: u64 = 1790520233;
+                let latest_block_hash = n.latest_block_hash;
+                let storage = n.storage.clone();
+                drop(n);
 
-                for i in 0..limit {
-                    if current_h < i as u64 { break; }
-                    let h = current_h - i as u64;
+                let scan = run_scan(limit as u64, move || {
+                    let started = std::time::Instant::now();
 
-                    let (b_time, b_hash, prop_hex, tx_count, st_root) = match n.storage.load_block(h) {
-                        Ok(Some(blk)) => {
-                            let prop = if blk.header.proposer == [0u8; 32] {
-                                proposer_hex.clone()
-                            } else {
-                                format!("0x{}", hex::encode(blk.header.proposer))
-                            };
-                            let raw_time = blk.header.timestamp;
-                            let effective_time = if raw_time <= 1725580800 {
-                                network_restart_ts.saturating_add(h * 12)
-                            } else {
-                                raw_time
-                            };
-                            (
-                                effective_time,
-                                format!("0x{}", hex::encode(blk.hash())),
-                                prop,
-                                blk.transactions.len().max(1),
-                                format!("0x{}", hex::encode(blk.header.state_root)),
-                            )
-                        }
-                        _ => {
-                            let hash = if i == 0 {
-                                format!("0x{}", hex::encode(n.latest_block_hash))
-                            } else {
-                                format!("0x{}", hex::encode(crate::chain_hash::hash256(format!("block_hash_{}", h).as_bytes())))
-                            };
-                            let effective_time = network_restart_ts.saturating_add(h * 12);
-                            (effective_time, hash, proposer_hex.clone(), 1, state_root_hex.clone())
-                        }
-                    };
+                    for i in 0..limit {
+                        if current_h < i as u64 || started.elapsed() > SCAN_BUDGET { break; }
+                        let h = current_h - i as u64;
 
-                    let age = now_ts.saturating_sub(b_time);
+                        let (b_time, b_hash, prop_hex, tx_count, st_root) = match storage.load_block(h) {
+                            Ok(Some(blk)) => {
+                                let prop = if blk.header.proposer == [0u8; 32] {
+                                    proposer_hex.clone()
+                                } else {
+                                    format!("0x{}", hex::encode(blk.header.proposer))
+                                };
+                                let raw_time = blk.header.timestamp;
+                                let effective_time = if raw_time <= 1725580800 {
+                                    network_restart_ts.saturating_add(h * 12)
+                                } else {
+                                    raw_time
+                                };
+                                (
+                                    effective_time,
+                                    format!("0x{}", hex::encode(blk.hash())),
+                                    prop,
+                                    blk.transactions.len().max(1),
+                                    format!("0x{}", hex::encode(blk.header.state_root)),
+                                )
+                            }
+                            _ => {
+                                let hash = if i == 0 {
+                                    format!("0x{}", hex::encode(latest_block_hash))
+                                } else {
+                                    format!("0x{}", hex::encode(crate::chain_hash::hash256(format!("block_hash_{}", h).as_bytes())))
+                                };
+                                let effective_time = network_restart_ts.saturating_add(h * 12);
+                                (effective_time, hash, proposer_hex.clone(), 1, state_root_hex.clone())
+                            }
+                        };
 
-                    blocks.push(serde_json::json!({
-                        "height": h,
-                        "hash": b_hash,
-                        "proposer": prop_hex,
-                        "tx_count": tx_count,
-                        "state_root": st_root,
-                        "timestamp": b_time,
-                        "age_secs": age,
-                    }));
+                        let age = now_ts.saturating_sub(b_time);
+
+                        blocks.push(serde_json::json!({
+                            "height": h,
+                            "hash": b_hash,
+                            "proposer": prop_hex,
+                            "tx_count": tx_count,
+                            "state_root": st_root,
+                            "timestamp": b_time,
+                            "age_secs": age,
+                        }));
+                    }
+                    Ok(blocks)
+                })
+                .await;
+
+                match scan {
+                    Ok(blocks) => Ok(serde_json::to_value(blocks).unwrap()),
+                    Err(error) => {
+                        return RpcResponse { jsonrpc: "2.0".to_string(), id: req.id, result: None, error: Some(error) };
+                    }
                 }
-                Ok(serde_json::to_value(blocks).unwrap())
             }
 
             "vera_blockNumber" => {
@@ -1860,7 +1922,8 @@ impl RpcHandler {
 
             _ => {
                 let code = -32601;
-                let msg = format!("Method not found: {}", req.method);
+                // Wording used by geth; ethers.js relies on it to fall back to eth_getLogs polling.
+                let msg = format!("the method {} does not exist/is not available", req.method);
                 return RpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id: req.id,

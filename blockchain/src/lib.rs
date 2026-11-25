@@ -4,7 +4,7 @@
 // ========================================================
 
 /// Node release version, reported by web3_clientVersion, `vera_node` and `vera_cli`.
-pub const NODE_VERSION: &str = "0.3.0-testnet";
+pub const NODE_VERSION: &str = "0.3.1-testnet";
 
 pub mod account;
 pub mod bisection;

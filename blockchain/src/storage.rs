@@ -77,6 +77,18 @@ impl PersistentStorage {
         Ok(())
     }
 
+    /// Height of the block saved under `hash`, from the `<hash>.hash` file `save_block` writes.
+    pub fn height_by_hash(&self, hash: &[u8; 32]) -> Option<u64> {
+        let path = self.blocks_dir.join(format!("{}.hash", hex::encode(hash)));
+        fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    /// Loads the block with this hash without walking the chain.
+    pub fn load_block_by_hash(&self, hash: &[u8; 32]) -> Option<Block> {
+        let block = self.load_block(self.height_by_hash(hash)?).ok().flatten()?;
+        (block.hash() == *hash).then_some(block)
+    }
+
     /// Loads block by height
     pub fn load_block(&self, height: u64) -> Result<Option<Block>, String> {
         let block_filename = format!("{:012}.blk", height);
