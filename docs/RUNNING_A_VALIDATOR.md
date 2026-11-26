@@ -51,7 +51,7 @@ Leap status     : Normal
 Download the release bundle, verify cryptographic signatures, and run the automated installer:
 ```bash
 mkdir -p ~/vera-testnet && cd ~/vera-testnet
-VER=v0.3.1-testnet   # use the latest release: https://github.com/Vera-SmartChain/vera-node-releases/releases/latest
+VER=v0.3.2-testnet   # use the latest release: https://github.com/Vera-SmartChain/vera-node-releases/releases/latest
 RELEASE_URL="https://github.com/Vera-SmartChain/vera-node-releases/releases/download/${VER}"
 for f in install.sh RELEASE.json SHA256SUMS SHA256SUMS.sig testnet-genesis.json vera-join.sh vera-node.service vera-release.pub vera-validator.service vera_cli vera_node; do
     wget -q --show-progress "${RELEASE_URL}/${f}"

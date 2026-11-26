@@ -8,6 +8,7 @@ use ed25519_dalek::SigningKey;
 
 use vera_blockchain::genesis::GenesisConfig;
 use vera_blockchain::node::{FullNode, SharedNode};
+use vera_blockchain::observe;
 use vera_blockchain::p2p::{P2PEvent, P2PPayload, P2PService, SyncRequest, SyncResponse, MAX_SYNC_RESPONSE_BYTES};
 use vera_blockchain::p2p::wire::MAX_P2P_FRAME_SIZE;
 use vera_blockchain::rpc::{RpcError, RpcHandler, RpcRequest, RpcResponse};
@@ -935,6 +936,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(format!("{}:{}", bind_host, port)).await?;
     println!("RPC Server listening on http://{}:{}", bind_host, port);
+    observe::spawn_stall_watchdog(observe::STALL_THRESHOLD, |event| match event {
+        observe::StallEvent::Stalled(d) => eprintln!("🛑 [Watchdog] The node has not responded for {:.1} s (RPC, networking or consensus work is blocking it)", d.as_secs_f64()),
+        observe::StallEvent::Recovered(d) => eprintln!("🛑 [Watchdog] The node responds again after about {:.1} s", d.as_secs_f64()),
+    });
 
     loop {
         let (mut socket, _) = listener.accept().await?;
@@ -1049,7 +1054,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let trimmed = json_payload.trim();
 
-                // Silent in release to avoid filling disk
+                let client = observe::client_from_headers(&request_str);
+
+                // Only refused or slow calls are logged (rate limited), to avoid filling disk
 
                 // Support JSON-RPC Batch Requests (MetaMask frequently uses [{...}, {...}])
                 if trimmed.starts_with('[') {
@@ -1072,7 +1079,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut to_gossip = Vec::new();
                         for req in batch_reqs {
                             let is_send_raw = req.method == "eth_sendRawTransaction" || req.method == "vera_sendRawTransaction";
+                            let method_name = req.method.clone();
+                            let detail = observe::describe_call(&req.method, &req.params);
+                            let started = std::time::Instant::now();
                             let res = RpcHandler::handle(&node_ref, req).await;
+                            observe::log_rpc(&method_name, &detail, &client, started.elapsed(), res.error.as_ref().map(|e| (e.code, e.message.as_str())));
                             if is_send_raw && res.error.is_none() {
                                 if let Some(tx) = admitted_tx(&node_ref, &res).await {
                                     to_gossip.push(tx);
@@ -1100,7 +1111,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if let Ok(rpc_req) = serde_json::from_str::<RpcRequest>(trimmed) { let method_name = rpc_req.method.clone();
                     let is_send_raw = rpc_req.method == "eth_sendRawTransaction" || rpc_req.method == "vera_sendRawTransaction";
+                    let detail = observe::describe_call(&rpc_req.method, &rpc_req.params);
+                    let started = std::time::Instant::now();
                     let rpc_res = RpcHandler::handle(&node_ref, rpc_req).await;
+                    observe::log_rpc(&method_name, &detail, &client, started.elapsed(), rpc_res.error.as_ref().map(|e| (e.code, e.message.as_str())));
                     if is_send_raw && rpc_res.error.is_none() {
                         if let Some(tx) = admitted_tx(&node_ref, &rpc_res).await {
                             let mut pm = node_pm.lock().await;
@@ -1108,9 +1122,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     let res_json = serde_json::to_string(&rpc_res).unwrap_or_default();
-                    if let Some(ref err) = rpc_res.error {
-                        eprintln!("⚠️ [RPC] method={} code={} error={}", method_name, err.code, err.message);
-                    }
                     let http_response = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: *\r\n\r\n{}",
                         res_json.len(),
